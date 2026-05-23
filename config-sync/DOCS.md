@@ -1,11 +1,12 @@
 # Config Sync (GitOps)
 
-Automatically sync your Home Assistant configuration from a GitHub repository.
-Changes merged to your branch are pulled on a schedule, validated against
-HA's config checker, and applied with an automatic reload. If validation
-fails, the change is rolled back and the error is logged.
+Bidirectional GitOps for Home Assistant. Pulls config from GitHub, validates,
+and reloads. Optionally exports HA-side changes (UI edits, manual tweaks)
+back to GitHub automatically.
 
 ## How it works
+
+### Import (GitHub → HA)
 
 1. The add-on clones your GitHub config repo on first start.
 2. Every `check_interval` seconds it runs `git fetch` to check for new commits.
@@ -15,21 +16,46 @@ fails, the change is rolled back and the error is logged.
 6. If valid, HA reloads automatically. If invalid, the files are rolled
    back to their previous state and the error is logged.
 
+### Export (HA → GitHub)
+
+When `export_enabled` is true:
+
+1. **On startup**, the add-on runs an immediate export — this captures any
+   changes made while the add-on was stopped, and seeds the repo on
+   first install.
+2. Every `export_interval` seconds, it compares `/config` files (filtered
+   by `sync_paths`) against the repo.
+3. If HA-side changes are detected (e.g., automations edited via the UI),
+   the add-on commits and pushes them to `export_branch`.
+4. Immediately after an import, the next export cycle is skipped to
+   avoid re-committing what was just pulled.
+
 ## Configuration
+
+### Import options
 
 | Option | Required | Default | Description |
 |--------|----------|---------|-------------|
 | `github_repo` | Yes | — | Full HTTPS URL of your config repo |
-| `branch` | No | `main` | Branch to track |
-| `check_interval` | No | `300` | Seconds between sync checks (60–3600) |
+| `branch` | No | `main` | Branch to track for import |
+| `check_interval` | No | `300` | Seconds between import checks (60–3600) |
 | `sync_paths` | No | See below | List of file/directory paths to sync |
-| `github_pat` | No | — | GitHub Personal Access Token (only for private repos) |
+| `github_pat` | No | — | GitHub PAT — required for export, optional for public repo import |
+
+### Export options
+
+| Option | Required | Default | Description |
+|--------|----------|---------|-------------|
+| `export_enabled` | No | `false` | Enable export (HA → GitHub) |
+| `export_interval` | No | `3600` | Seconds between auto-export checks (300–86400) |
+| `export_branch` | No | same as `branch` | Branch to push exports to |
+| `export_commit_message` | No | `export: HA config snapshot` | Prefix for export commit messages |
 
 ### sync_paths
 
-Controls which files from the repo are eligible to be copied into `/config`.
-Paths ending in `/` are treated as directory prefixes (everything underneath
-is included). All other entries are exact filename matches.
+Controls which files are eligible for both import and export. Paths ending
+in `/` are treated as directory prefixes (everything underneath is included).
+All other entries are exact filename matches.
 
 Default paths:
 
@@ -42,60 +68,84 @@ Default paths:
 - `packages/`
 - `dashboards/`
 
-Files in the repo that don't match any `sync_paths` entry are ignored
-(e.g., `README.md`, `.github/`, `scripts/`). This prevents repo metadata
-from being copied into your HA config directory.
+### Private repos and export
 
-### Private repos
+Export requires a GitHub PAT with `repo` scope (read + write). Create a
+Personal Access Token (classic) in GitHub and paste it into `github_pat`.
+Without a PAT, the add-on will commit locally but cannot push to GitHub.
 
-If your config repo is private, create a GitHub Personal Access Token
-(classic, with `repo` scope) and paste it into `github_pat`. The token
-is stored encrypted in HA's add-on options. For public repos, leave this
-field empty.
+## Workflows
+
+### Import-only (default)
+
+Edit config in GitHub → merge to branch → add-on pulls and validates → HA reloads.
+
+### Export-only
+
+Set `export_enabled: true`. Make changes via the HA UI → add-on detects
+the drift → commits and pushes to GitHub. Useful for backing up UI-driven
+configurations.
+
+### Bidirectional
+
+Set `export_enabled: true`. Edit config in GitHub OR in the HA UI — both
+directions are handled. Import takes priority: after a pull from GitHub,
+the next export cycle is skipped to avoid a feedback loop.
+
+For cleaner git history with bidirectional sync, set `export_branch` to a
+separate branch (e.g., `ha-export`). HA-side changes land on that branch
+and can be reviewed via PR before merging to `main`.
+
+### Seeding the repo
+
+To populate an empty repo with your current HA config:
+
+1. Set `export_enabled: true`
+2. Start the add-on
+3. The initial export commits all `sync_paths` files to the repo
+4. Optionally disable export afterward if you only want one-way import
 
 ## Security
 
-- **No manual tokens.** The add-on uses the auto-injected `$SUPERVISOR_TOKEN`
-  to communicate with HA's API. No long-lived access token needed.
-- **No Samba.** The add-on accesses `/config` directly via the Supervisor's
-  `map: config:rw` mechanism — same trust level as File Editor or Studio
-  Code Server.
-- **No inbound ports.** The add-on only makes outbound HTTPS calls to GitHub.
-- **Rollback on failure.** If a config change breaks validation, it's
-  automatically reverted before HA tries to load it.
-- **GitHub PAT** (if used) is stored in HA's encrypted add-on option store,
-  never written to disk in the container.
+- **No manual HA tokens.** The add-on uses the auto-injected `$SUPERVISOR_TOKEN`
+  for HA API calls.
+- **No Samba.** Direct `/config` access via the Supervisor's `map: config:rw`.
+- **No inbound ports.** Only outbound HTTPS to GitHub.
+- **Rollback on failure.** Invalid imports are automatically reverted.
+- **GitHub PAT** is stored in HA's encrypted add-on option store.
+- **Export commits** are attributed to `HA Config Sync <config-sync@homeassistant.local>`
+  for clear audit trail in git history.
 
 ## Logs
 
-Check the **Log** tab in the add-on panel. Typical log entries:
+Check the **Log** tab in the add-on panel.
+
+### Import logs
 
 ```
-[config-sync] First run — cloning https://github.com/user/repo (branch: main)
-[config-sync] Clone complete
-[config-sync] Starting sync loop — checking every 300s
-[config-sync] Change detected: abc12345 -> def67890
-[config-sync] Syncing: configuration.yaml automations.yaml
-[config-sync] Config valid — reloading Home Assistant
-[config-sync] Reload complete (abc12345 -> def67890)
+[config-sync] Import: change detected (abc12345 -> def67890)
+[config-sync] Import: syncing configuration.yaml automations.yaml
+[config-sync] Import: config valid — reloading Home Assistant
+[config-sync] Import: reload complete (abc12345 -> def67890)
 ```
 
-On failure:
+### Export logs
 
 ```
-[config-sync] Config invalid: Integration 'nonexistent' not found
-[config-sync] Rolling back to abc12345
+[config-sync] Export enabled — running initial export
+[config-sync] Export (initial): committed automations.yaml scripts.yaml
+[config-sync] Export (initial): pushed to origin/main
+[config-sync] Export (auto): committed automations.yaml
+[config-sync] Export (auto): pushed to origin/main
 ```
 
-## Workflow
+### Error logs
 
-The intended workflow for managing your HA config:
-
-1. Edit config files in your GitHub repo (directly or via pull request).
-2. Merge to the tracked branch.
-3. Within `check_interval` seconds, the add-on pulls the change.
-4. If valid, HA reloads with the new config.
-5. If invalid, the change is rolled back — HA stays on the last good config.
+```
+[config-sync] Import: config invalid: Integration 'nonexistent' not found
+[config-sync] Import: rolling back to abc12345
+[config-sync] Export: no github_pat configured — cannot push (read-only)
+```
 
 ## Agent integration
 
@@ -106,6 +156,9 @@ Any agent or automation platform that can call the HA REST API can:
 - Start/stop/restart: `POST /addons/config-sync/{start,stop,restart}`
 - Read logs: `GET /addons/config-sync/logs`
 - Check status: `GET /addons/config-sync/info`
+
+To trigger an on-demand export, an agent can restart the add-on — the
+initial export runs on every startup when `export_enabled` is true.
 
 This makes it compatible with NanoClaw's `agent-homeops`, Home Assistant
 automations, or any future agent platform.
