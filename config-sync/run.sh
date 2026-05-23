@@ -1,11 +1,11 @@
 #!/usr/bin/with-bashio
 # shellcheck shell=bash
 # ---------------------------------------------------------------
-# Config Sync (GitOps) — HA Supervisor Add-on
+# Config Sync (GitOps) — HA Supervisor Add-on  v1.1.0
 #
-# Pulls HA configuration from a GitHub repo on a schedule,
-# validates via the Supervisor API, reloads HA on success,
-# and auto-rolls back on failure.
+# Bidirectional sync:
+#   IMPORT — pull config from GitHub → validate → reload HA
+#   EXPORT — detect HA-side changes → commit + push to GitHub
 #
 # All configuration is read from the HA add-on options GUI
 # via bashio.  The Supervisor token is auto-injected by HA.
@@ -18,15 +18,27 @@ BRANCH=$(bashio::config 'branch')
 INTERVAL=$(bashio::config 'check_interval')
 PAT=$(bashio::config 'github_pat')
 
+# Export options
+EXPORT_ENABLED=$(bashio::config 'export_enabled')
+EXPORT_INTERVAL=$(bashio::config 'export_interval')
+EXPORT_BRANCH=$(bashio::config 'export_branch')
+EXPORT_MSG=$(bashio::config 'export_commit_message')
+
 # ── Constants ────────────────────────────────────────────────────
 REPO_DIR="/data/repo"
 CONFIG_DIR="/config"
 ROLLBACK_DIR="/data/.rollback"
+LAST_IMPORT_MARKER="/data/.last-import"
+LAST_EXPORT_TS="/data/.last-export-ts"
+
+# Default export branch to the sync branch if not set
+if [ -z "${EXPORT_BRANCH}" ]; then
+    EXPORT_BRANCH="${BRANCH}"
+fi
 
 # ── Helpers ──────────────────────────────────────────────────────
 
-# Build the sync_paths allowlist from config.  Paths ending in /
-# are treated as directory prefixes; everything else is exact match.
+# Build the sync_paths allowlist from config.
 build_sync_filter() {
     local i=0
     SYNC_PATHS=()
@@ -40,11 +52,9 @@ build_sync_filter() {
 path_allowed() {
     local file="$1"
     for pattern in "${SYNC_PATHS[@]}"; do
-        # Directory prefix: "packages/" matches "packages/lighting.yaml"
         if [[ "${pattern}" == */ ]] && [[ "${file}" == "${pattern}"* ]]; then
             return 0
         fi
-        # Exact match
         if [[ "${file}" == "${pattern}" ]]; then
             return 0
         fi
@@ -62,6 +72,12 @@ supervisor_api() {
         2>/dev/null
 }
 
+# ── Git setup ───────────────────────────────────────────────────
+
+# Configure git identity for export commits
+git config --global user.name "HA Config Sync"
+git config --global user.email "config-sync@homeassistant.local"
+
 # ── Initial clone ────────────────────────────────────────────────
 if [ ! -d "${REPO_DIR}/.git" ]; then
     bashio::log.info "First run — cloning ${REPO} (branch: ${BRANCH})"
@@ -73,8 +89,7 @@ if [ ! -d "${REPO_DIR}/.git" ]; then
     bashio::log.info "Clone complete"
 fi
 
-# If PAT is set, ensure the remote URL includes it (handles PAT
-# rotation without re-cloning).
+# Ensure remote URL has current PAT
 if [ -n "${PAT}" ]; then
     AUTH_URL=$(echo "${REPO}" | sed "s|https://|https://${PAT}@|")
     git -C "${REPO_DIR}" remote set-url origin "${AUTH_URL}"
@@ -85,37 +100,154 @@ fi
 # Build the path allowlist once at startup.
 build_sync_filter
 bashio::log.info "Sync paths: ${SYNC_PATHS[*]}"
-bashio::log.info "Starting sync loop — checking every ${INTERVAL}s"
 
-# ── Main loop ────────────────────────────────────────────────────
-while true; do
+# ================================================================
+#  EXPORT FUNCTIONS
+# ================================================================
+
+# Copy sync_paths files from /config into the repo working tree.
+# Only touches files that match the sync_paths allowlist.
+stage_config_to_repo() {
+    local changed=0
+
+    for pattern in "${SYNC_PATHS[@]}"; do
+        if [[ "${pattern}" == */ ]]; then
+            # Directory prefix — copy matching files
+            if [ -d "${CONFIG_DIR}/${pattern}" ]; then
+                mkdir -p "${REPO_DIR}/${pattern}"
+                find "${CONFIG_DIR}/${pattern}" -type f -name '*.yaml' -o -name '*.yml' | while read -r src; do
+                    rel="${src#${CONFIG_DIR}/}"
+                    mkdir -p "${REPO_DIR}/$(dirname "${rel}")"
+                    if ! cmp -s "${src}" "${REPO_DIR}/${rel}" 2>/dev/null; then
+                        cp "${src}" "${REPO_DIR}/${rel}"
+                        changed=1
+                    fi
+                done
+            fi
+        else
+            # Exact file match
+            if [ -f "${CONFIG_DIR}/${pattern}" ]; then
+                if ! cmp -s "${CONFIG_DIR}/${pattern}" "${REPO_DIR}/${pattern}" 2>/dev/null; then
+                    mkdir -p "${REPO_DIR}/$(dirname "${pattern}")"
+                    cp "${CONFIG_DIR}/${pattern}" "${REPO_DIR}/${pattern}"
+                    changed=1
+                fi
+            fi
+        fi
+    done
+
+    return ${changed}
+}
+
+# Run one export cycle: compare /config to repo, commit + push if different.
+do_export() {
+    local label="$1"  # "initial" or "auto"
+
     cd "${REPO_DIR}"
 
-    # ── Fetch ────────────────────────────────────────────────────
+    # If we just did an import, skip this export cycle to avoid
+    # re-committing what we just pulled.
+    if [ -f "${LAST_IMPORT_MARKER}" ]; then
+        local import_sha
+        import_sha=$(cat "${LAST_IMPORT_MARKER}")
+        local current_sha
+        current_sha=$(git rev-parse HEAD)
+        if [ "${import_sha}" = "${current_sha}" ]; then
+            bashio::log.debug "Skipping export — last action was an import"
+            return 0
+        fi
+    fi
+
+    # Ensure we're on the export branch
+    local current_branch
+    current_branch=$(git rev-parse --abbrev-ref HEAD)
+    if [ "${current_branch}" != "${EXPORT_BRANCH}" ]; then
+        # Fetch the export branch if it exists remotely
+        git fetch origin "${EXPORT_BRANCH}" --quiet 2>/dev/null || true
+        if git show-ref --verify --quiet "refs/remotes/origin/${EXPORT_BRANCH}"; then
+            git checkout "${EXPORT_BRANCH}" --quiet 2>/dev/null || \
+                git checkout -b "${EXPORT_BRANCH}" "origin/${EXPORT_BRANCH}" --quiet
+        else
+            git checkout -b "${EXPORT_BRANCH}" --quiet 2>/dev/null || \
+                git checkout "${EXPORT_BRANCH}" --quiet
+        fi
+    fi
+
+    # Stage /config files into the repo
+    stage_config_to_repo || true
+
+    # Check for actual changes
+    git add -A
+    if git diff --cached --quiet; then
+        bashio::log.debug "Export (${label}): no changes to export"
+        # Switch back to sync branch if different
+        if [ "${EXPORT_BRANCH}" != "${BRANCH}" ]; then
+            git checkout "${BRANCH}" --quiet 2>/dev/null || true
+        fi
+        return 0
+    fi
+
+    # Commit with timestamp
+    local ts
+    ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+    local files_changed
+    files_changed=$(git diff --cached --name-only | tr '\n' ' ')
+    git commit -m "${EXPORT_MSG} (${ts})" -m "Files: ${files_changed}" --quiet
+
+    bashio::log.info "Export (${label}): committed ${files_changed}"
+
+    # Push
+    if [ -z "${PAT}" ]; then
+        bashio::log.warning "Export: no github_pat configured — cannot push (read-only)"
+        # Switch back
+        if [ "${EXPORT_BRANCH}" != "${BRANCH}" ]; then
+            git checkout "${BRANCH}" --quiet 2>/dev/null || true
+        fi
+        return 1
+    fi
+
+    if git push origin "${EXPORT_BRANCH}" --quiet 2>/dev/null; then
+        bashio::log.info "Export (${label}): pushed to origin/${EXPORT_BRANCH}"
+        date -u '+%s' > "${LAST_EXPORT_TS}"
+    else
+        bashio::log.error "Export (${label}): push failed"
+    fi
+
+    # Switch back to sync branch if different
+    if [ "${EXPORT_BRANCH}" != "${BRANCH}" ]; then
+        git checkout "${BRANCH}" --quiet 2>/dev/null || true
+    fi
+}
+
+# ================================================================
+#  IMPORT FUNCTION (extracted from v1.0.0 main loop)
+# ================================================================
+
+do_import() {
+    cd "${REPO_DIR}"
+
+    # Fetch
     if ! git fetch origin "${BRANCH}" --quiet 2>/dev/null; then
         bashio::log.error "git fetch failed — will retry next cycle"
-        sleep "${INTERVAL}"
-        continue
+        return 1
     fi
 
     LOCAL=$(git rev-parse HEAD)
     REMOTE=$(git rev-parse "origin/${BRANCH}")
 
     if [ "${LOCAL}" = "${REMOTE}" ]; then
-        sleep "${INTERVAL}"
-        continue
+        return 0  # no changes
     fi
 
-    bashio::log.info "Change detected: ${LOCAL:0:8} -> ${REMOTE:0:8}"
+    bashio::log.info "Import: change detected (${LOCAL:0:8} -> ${REMOTE:0:8})"
 
-    # ── Fast-forward merge ───────────────────────────────────────
+    # Fast-forward merge
     if ! git merge "origin/${BRANCH}" --ff-only --quiet 2>/dev/null; then
-        bashio::log.error "Fast-forward merge failed — local divergence?"
-        bashio::log.warning "Resetting to origin/${BRANCH}"
+        bashio::log.error "Fast-forward merge failed — resetting to origin/${BRANCH}"
         git reset --hard "origin/${BRANCH}"
     fi
 
-    # ── Identify changed files that pass the sync filter ─────────
+    # Identify changed files that pass the sync filter
     CHANGED_ALL=$(git diff --name-only "${LOCAL}" "${REMOTE}" || true)
     CHANGED=""
     SKIPPED=""
@@ -130,18 +262,17 @@ while true; do
     done <<< "${CHANGED_ALL}"
 
     if [ -n "${SKIPPED}" ]; then
-        bashio::log.info "Skipped (not in sync_paths): ${SKIPPED}"
+        bashio::log.info "Import: skipped (not in sync_paths): ${SKIPPED}"
     fi
 
     if [ -z "${CHANGED}" ]; then
-        bashio::log.info "No syncable config files changed"
-        sleep "${INTERVAL}"
-        continue
+        bashio::log.info "Import: no syncable config files changed"
+        return 0
     fi
 
-    bashio::log.info "Syncing: $(echo "${CHANGED}" | tr '\n' ' ')"
+    bashio::log.info "Import: syncing $(echo "${CHANGED}" | tr '\n' ' ')"
 
-    # ── Backup affected files ────────────────────────────────────
+    # Backup affected files
     BACKUP="${ROLLBACK_DIR}/${LOCAL:0:8}"
     rm -rf "${BACKUP}"
     mkdir -p "${BACKUP}"
@@ -154,43 +285,43 @@ while true; do
         fi
     done <<< "${CHANGED}"
 
-    # ── Copy changed files to /config ────────────────────────────
+    # Copy changed files to /config
     while IFS= read -r f; do
         [ -z "${f}" ] && continue
         if [ -f "${REPO_DIR}/${f}" ]; then
             mkdir -p "${CONFIG_DIR}/$(dirname "${f}")"
             cp "${REPO_DIR}/${f}" "${CONFIG_DIR}/${f}"
-            bashio::log.debug "Copied: ${f}"
+            bashio::log.debug "Import: copied ${f}"
         fi
     done <<< "${CHANGED}"
 
-    # Brief pause for HA to notice file changes
-    sleep 2
+    sleep 2  # let HA notice file changes
 
-    # ── Validate config via Supervisor API ───────────────────────
+    # Validate config via Supervisor API
     CHECK_RESULT=$(supervisor_api POST "/core/api/config/core/check_config") || {
-        bashio::log.error "check-config API unreachable — rolling back"
+        bashio::log.error "Import: check-config API unreachable — rolling back"
         while IFS= read -r f; do
             [ -z "${f}" ] && continue
             [ -f "${BACKUP}/${f}" ] && cp "${BACKUP}/${f}" "${CONFIG_DIR}/${f}"
         done <<< "${CHANGED}"
         git reset --hard "${LOCAL}"
         rm -rf "${BACKUP}"
-        sleep "${INTERVAL}"
-        continue
+        return 1
     }
 
     VALID=$(echo "${CHECK_RESULT}" | jq -r '.result // empty' 2>/dev/null)
 
     if [ "${VALID}" = "valid" ]; then
-        bashio::log.info "Config valid — reloading Home Assistant"
+        bashio::log.info "Import: config valid — reloading Home Assistant"
         supervisor_api POST "/core/api/services/homeassistant/reload_all" > /dev/null 2>&1 || true
-        bashio::log.info "Reload complete (${LOCAL:0:8} -> ${REMOTE:0:8})"
+        bashio::log.info "Import: reload complete (${LOCAL:0:8} -> ${REMOTE:0:8})"
         rm -rf "${BACKUP}"
+        # Mark that we just imported — export should skip next cycle
+        git rev-parse HEAD > "${LAST_IMPORT_MARKER}"
     else
         ERROR_MSG=$(echo "${CHECK_RESULT}" | jq -r '.errors // .message // "unknown error"' 2>/dev/null)
-        bashio::log.error "Config invalid: ${ERROR_MSG}"
-        bashio::log.warning "Rolling back to ${LOCAL:0:8}"
+        bashio::log.error "Import: config invalid: ${ERROR_MSG}"
+        bashio::log.warning "Import: rolling back to ${LOCAL:0:8}"
         while IFS= read -r f; do
             [ -z "${f}" ] && continue
             [ -f "${BACKUP}/${f}" ] && cp "${BACKUP}/${f}" "${CONFIG_DIR}/${f}"
@@ -204,6 +335,43 @@ while true; do
         ls -1t "${ROLLBACK_DIR}" 2>/dev/null | tail -n +6 | while read -r old; do
             rm -rf "${ROLLBACK_DIR:?}/${old}"
         done
+    fi
+
+    return 0
+}
+
+# ================================================================
+#  STARTUP
+# ================================================================
+
+# One-time export on startup (seeds the repo if empty, or captures
+# any HA-side changes made while the add-on was stopped).
+if [ "${EXPORT_ENABLED}" = "true" ]; then
+    bashio::log.info "Export enabled — running initial export"
+    do_export "initial" || true
+    bashio::log.info "Export interval: ${EXPORT_INTERVAL}s, branch: ${EXPORT_BRANCH}"
+fi
+
+bashio::log.info "Starting main loop — import every ${INTERVAL}s"
+
+# ================================================================
+#  MAIN LOOP
+# ================================================================
+
+IMPORT_COUNTER=0
+EXPORT_CYCLES=$(( EXPORT_INTERVAL / INTERVAL ))  # how many import cycles per export
+if [ "${EXPORT_CYCLES}" -lt 1 ]; then
+    EXPORT_CYCLES=1
+fi
+
+while true; do
+    # ── Import (every cycle) ─────────────────────────────────
+    do_import || true
+
+    # ── Export (every EXPORT_CYCLES import cycles) ───────────
+    IMPORT_COUNTER=$(( IMPORT_COUNTER + 1 ))
+    if [ "${EXPORT_ENABLED}" = "true" ] && [ $(( IMPORT_COUNTER % EXPORT_CYCLES )) -eq 0 ]; then
+        do_export "auto" || true
     fi
 
     sleep "${INTERVAL}"
