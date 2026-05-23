@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.1.5
+
+- **Feature**: Add `scripts/` directory to default `sync_paths` so
+  script files split into a directory are synced alongside `scripts.yaml`
+
 ## 1.1.4
 
 - **Fix**: Add `homeassistant_api: true` to config.yaml so the add-on
