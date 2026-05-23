@@ -1,7 +1,9 @@
-#!/usr/bin/with-bashio
+#!/usr/bin/env bash
 # shellcheck shell=bash
+# Source the bashio library (HA add-on option parsing + logging)
+source /usr/lib/bashio/bashio.sh
 # ---------------------------------------------------------------
-# Config Sync (GitOps) — HA Supervisor Add-on  v1.1.0
+# Config Sync (GitOps) — HA Supervisor Add-on  v1.1.2
 #
 # Bidirectional sync:
 #   IMPORT — pull config from GitHub → validate → reload HA
@@ -12,7 +14,7 @@
 # ---------------------------------------------------------------
 set -euo pipefail
 
-# ── Read add-on options ──────────────────────────────────────────
+# ── Read add-on options ──────────────────────────────────────────────────
 REPO=$(bashio::config 'github_repo')
 BRANCH=$(bashio::config 'branch')
 INTERVAL=$(bashio::config 'check_interval')
@@ -24,7 +26,7 @@ EXPORT_INTERVAL=$(bashio::config 'export_interval')
 EXPORT_BRANCH=$(bashio::config 'export_branch')
 EXPORT_MSG=$(bashio::config 'export_commit_message')
 
-# ── Constants ────────────────────────────────────────────────────
+# ── Constants ──────────────────────────────────────────────────────
 REPO_DIR="/data/repo"
 CONFIG_DIR="/config"
 ROLLBACK_DIR="/data/.rollback"
@@ -36,7 +38,7 @@ if [ -z "${EXPORT_BRANCH}" ]; then
     EXPORT_BRANCH="${BRANCH}"
 fi
 
-# ── Helpers ──────────────────────────────────────────────────────
+# ── Helpers ────────────────────────────────────────────────────────
 
 # Build the sync_paths allowlist from config.
 build_sync_filter() {
@@ -72,13 +74,13 @@ supervisor_api() {
         2>/dev/null
 }
 
-# ── Git setup ───────────────────────────────────────────────────
+# ── Git setup ─────────────────────────────────────────────────────
 
 # Configure git identity for export commits
 git config --global user.name "HA Config Sync"
 git config --global user.email "config-sync@homeassistant.local"
 
-# ── Initial clone ────────────────────────────────────────────────
+# ── Initial clone ──────────────────────────────────────────────────
 if [ ! -d "${REPO_DIR}/.git" ]; then
     bashio::log.info "First run — cloning ${REPO} (branch: ${BRANCH})"
     CLONE_URL="${REPO}"
@@ -220,7 +222,7 @@ do_export() {
 }
 
 # ================================================================
-#  IMPORT FUNCTION (extracted from v1.0.0 main loop)
+#  IMPORT FUNCTION
 # ================================================================
 
 do_import() {
@@ -365,7 +367,7 @@ if [ "${EXPORT_CYCLES}" -lt 1 ]; then
 fi
 
 while true; do
-    # ── Import (every cycle) ─────────────────────────────────
+    # ── Import (every cycle) ─────────────────────────────────────
     do_import || true
 
     # ── Export (every EXPORT_CYCLES import cycles) ───────────
