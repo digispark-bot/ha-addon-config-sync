@@ -12,7 +12,7 @@ back to GitHub automatically.
 2. Every `check_interval` seconds it runs `git fetch` to check for new commits.
 3. When new commits are found, it identifies which files changed.
 4. Only files matching your `sync_paths` allowlist are copied to `/config`.
-5. HA's config checker validates the result via the Supervisor API.
+5. HA’s config checker validates the result via the Supervisor API.
 6. If valid, HA reloads automatically. If invalid, the files are rolled
    back to their previous state and the error is logged.
 
@@ -40,7 +40,7 @@ When `export_enabled` is true:
 | `branch` | No | `main` | Branch to track for import |
 | `check_interval` | No | `300` | Seconds between import checks (60–3600) |
 | `sync_paths` | No | See below | List of file/directory paths to sync |
-| `github_pat` | No | — | GitHub PAT — required for export, optional for public repo import |
+| `github_pat` | No | — | GitHub PAT — required for private repos and export (see below) |
 
 ### Export options
 
@@ -68,11 +68,33 @@ Default paths:
 - `packages/`
 - `dashboards/`
 
-### Private repos and export
+### GitHub Personal Access Token
 
-Export requires a GitHub PAT with `repo` scope (read + write). Create a
-Personal Access Token (classic) in GitHub and paste it into `github_pat`.
-Without a PAT, the add-on will commit locally but cannot push to GitHub.
+A GitHub PAT is required for private repos (import) and for export (push).
+Public repo import works without a PAT.
+
+**Fine-grained PAT (recommended):**
+
+1. Go to [GitHub → Settings → Developer settings → Personal access tokens → Fine-grained tokens](https://github.com/settings/personal-access-tokens/new).
+2. Set a descriptive name (e.g., `ha-config-sync`).
+3. Set expiration (recommend 90 days; you can rotate by pasting a new token into the add-on config).
+4. Under **Repository access**, select **Only select repositories** and pick your config repo.
+5. Under **Permissions → Repository permissions**, set **Contents** to **Read and write**. No other permissions are needed.
+6. Click **Generate token** and paste it into the `github_pat` field in the add-on config.
+
+**Classic PAT (simpler, broader scope):**
+
+1. Go to [GitHub → Settings → Developer settings → Personal access tokens → Tokens (classic)](https://github.com/settings/tokens/new).
+2. Set a descriptive name and expiration.
+3. Check the `repo` scope (grants read/write to all your repos).
+4. Click **Generate token** and paste it into `github_pat`.
+
+Fine-grained is preferred because it limits access to a single repository
+with only the permissions the add-on actually uses (`git clone` and
+`git push`). Classic PATs grant broader access across all repositories.
+
+The token is stored in HA’s encrypted add-on option store and is never
+written to disk inside the container.
 
 ## Workflows
 
@@ -109,10 +131,12 @@ To populate an empty repo with your current HA config:
 
 - **No manual HA tokens.** The add-on uses the auto-injected `$SUPERVISOR_TOKEN`
   for HA API calls.
-- **No Samba.** Direct `/config` access via the Supervisor's `map: config:rw`.
+- **No Samba.** Direct `/config` access via the Supervisor’s `map: config:rw`.
 - **No inbound ports.** Only outbound HTTPS to GitHub.
 - **Rollback on failure.** Invalid imports are automatically reverted.
-- **GitHub PAT** is stored in HA's encrypted add-on option store.
+- **GitHub PAT** is stored in HA’s encrypted add-on option store.
+  Fine-grained tokens scoped to a single repo with Contents read/write
+  are recommended over classic tokens with broad `repo` scope.
 - **Export commits** are attributed to `HA Config Sync <config-sync@homeassistant.local>`
   for clear audit trail in git history.
 
@@ -160,5 +184,5 @@ Any agent or automation platform that can call the HA REST API can:
 To trigger an on-demand export, an agent can restart the add-on — the
 initial export runs on every startup when `export_enabled` is true.
 
-This makes it compatible with NanoClaw's `agent-homeops`, Home Assistant
+This makes it compatible with NanoClaw’s `agent-homeops`, Home Assistant
 automations, or any future agent platform.
