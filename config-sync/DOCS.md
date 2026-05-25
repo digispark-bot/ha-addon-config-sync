@@ -15,48 +15,35 @@ back to GitHub automatically.
 5. **sync_paths gap guard (v1.5.1+)**: if `configuration.yaml` has
    `!include_dir_*` directives targeting directories not in `sync_paths`
    AND this sync's diff has files under those directories, the sync is
-   aborted with a copy-paste fix recipe in the log. Configurable via
-   `strict_sync_paths_check`.
-6. **A pre-sync HA backup is triggered** (named `gitops-pre-<short_sha>`)
-   covering the `homeassistant` folder. If the backup API fails, the sync
-   aborts and rolls back the local git state so the next cycle retries.
-7. HA's config checker validates the result via the Supervisor API.
-8. If valid, HA reloads automatically.
-9. **Post-sync verification probes** check that HA's state machine and REST
-   API are responsive after the reload. Either probe failing triggers
-   file-level rollback + best-effort re-reload, and the operator is pointed
-   at the named pre-sync backup for storage-level restore.
-10. If invalid at any step, the files are rolled back and the error is logged.
-11. The outcome is published to `sensor.config_sync_status` (v1.5.0+) so
-    the operator sees the result on dashboards and automations can react.
-12. **Old `gitops-pre-*` backups are pruned (v1.5.2+)**: the add-on keeps
-    the most-recent `pre_sync_backup_retention` (default 7) and deletes the
-    rest. The just-created backup is always in the keep set.
+   aborted with a copy-paste fix recipe in the log.
+6. **Tracked-symlink guard (v1.6.0+)**: if any tracked file matching
+   `sync_paths` is a symlink in the repo, the sync is aborted (path-
+   traversal vector). Configurable via `block_symlinks`.
+7. **A pre-sync HA backup is triggered** (named `gitops-pre-<short_sha>`).
+8. HA's config checker validates the result via the Supervisor API.
+9. If valid, HA reloads automatically.
+10. **Post-sync verification probes** check that HA's state machine and REST
+    API are responsive after the reload.
+11. If invalid at any step, the files are rolled back.
+12. The outcome is published to `sensor.config_sync_status` (v1.5.0+).
+13. **Old `gitops-pre-*` backups are pruned (v1.5.2+)**.
 
-Network operations to GitHub (`git fetch`, `git push`, `git clone`)
-are hard-bounded by `GIT_HTTP_LOW_SPEED_LIMIT=1000` +
-`GIT_HTTP_LOW_SPEED_TIMEOUT=60` as of v1.5.4 — they abort if
-throughput stays below 1 KB/s for 60 seconds. Supervisor API calls
-are similarly bounded by `--max-time 30 --connect-timeout 5`.
-Without these, a stalled network or hung Supervisor would wedge the
-single-threaded sync loop indefinitely.
+Network operations to GitHub are hard-bounded by
+`GIT_HTTP_LOW_SPEED_LIMIT=1000` + `GIT_HTTP_LOW_SPEED_TIMEOUT=60` as of
+v1.5.4. Supervisor API calls are bounded by `--max-time 30
+--connect-timeout 5`. The `github_repo` URL host must match the
+`allowed_repo_hosts` allowlist (v1.6.0+).
 
 ### Export (HA → GitHub)
 
 When `export_enabled` is true:
 
-1. **On startup**, the add-on runs an immediate export — this captures any
-   changes made while the add-on was stopped, and seeds the repo on
-   first install.
-2. Every `export_interval` seconds, it compares `/config` files (filtered
-   by `sync_paths`) against the repo.
-3. If HA-side changes are detected (e.g., automations edited via the UI),
-   the add-on commits and pushes them to `export_branch`.
-4. Immediately after an import, the next export cycle is skipped to
-   avoid re-committing what was just pulled.
+1. **On startup**, the add-on runs an immediate export.
+2. Every `export_interval` seconds, it compares `/config` files against the repo.
+3. If HA-side changes are detected, the add-on commits and pushes them.
+4. Immediately after an import, the next export cycle is skipped.
 5. **Each export cycle with real changes writes a per-export structured
-   log (v1.5.3+)** under `/data/logs/export/` so operators can
-   reconstruct any past push.
+   log (v1.5.3+)** under `/data/logs/export/`.
 
 ## Configuration
 
@@ -64,16 +51,18 @@ When `export_enabled` is true:
 
 | Option | Required | Default | Description |
 |--------|----------|---------|-------------|
-| `github_repo` | Yes | — | Full HTTPS URL of your config repo |
+| `github_repo` | Yes | — | Full HTTPS URL of your config repo. Host must be in `allowed_repo_hosts` (v1.6.0+). |
 | `branch` | No | `main` | Branch to track for import |
 | `check_interval` | No | `300` | Seconds between import checks (60–3600) |
 | `sync_paths` | No | See below | List of file/directory paths to sync |
-| `github_pat` | No | — | GitHub PAT — required for private repos and export (see below) |
-| `post_sync_settle_seconds` | No | `5` | Seconds to wait after `reload_all` before running verification probes. Bump for slow HA setups; 0 disables the settle delay. Range: 0–60. |
-| `restart_on_lovelace_change` | No | `true` | When `true`, calls `/core/restart` (instead of `reload_all`) when this sync touches the lovelace key in `configuration.yaml`. Required for new `lovelace.dashboards` entries to register — see Sprint 3 / v1.4.0. Disable only on latency-sensitive setups (with the known caveat that dashboard changes won't take effect without manual restart). |
-| `notify_on_failure` | No | `true` | When `true`, raises an HA persistent_notification on every sync failure and auto-dismisses it on the next healthy sync. Disable for headless deployments. |
-| `strict_sync_paths_check` | No | `true` | When `true` (v1.5.1+), aborts the sync if `configuration.yaml` has `!include_dir_*` directives targeting directories not in `sync_paths` AND the diff contains files under those directories. Prevents the 2026-05-25 incident class structurally. Set to `false` to log the gap loudly but continue the sync (v1.5.0 behavior). |
-| `pre_sync_backup_retention` | No | `7` | How many `gitops-pre-*` HA backups to keep (v1.5.2+). After every sync that took a backup, the add-on prunes anything past the Nth most recent. The just-created backup is always in the keep set. Set to `0` to disable pruning (v1.5.1 behavior — backups accumulate forever). Range: 0–50. |
+| `github_pat` | No | — | GitHub PAT — required for private repos and export. See "Where the PAT lives at runtime" below. |
+| `post_sync_settle_seconds` | No | `5` | Seconds to wait after `reload_all` before running verification probes. |
+| `restart_on_lovelace_change` | No | `true` | When `true`, calls `/core/restart` instead of `reload_all` when the diff touches the lovelace key. |
+| `notify_on_failure` | No | `true` | Raise HA persistent_notification on every sync failure. |
+| `strict_sync_paths_check` | No | `true` | Abort sync if !include_dir_* directives reference directories outside sync_paths. (v1.5.1+) |
+| `pre_sync_backup_retention` | No | `7` | How many `gitops-pre-*` HA backups to keep. `0` disables pruning. (v1.5.2+) |
+| `allowed_repo_hosts` | No | `["github.com"]` | List of hostnames `github_repo` is allowed to point at (v1.6.0+). Subdomain matches allowed via suffix-match. Add your GitHub Enterprise hostname here if applicable. Setting this to an empty list defaults back to `["github.com"]`. |
+| `block_symlinks` | No | `true` | Abort sync if any tracked file in `sync_paths` is a symlink (v1.6.0+). Symlinks in tracked config files are a path-traversal vector. Set to `false` if you intentionally use symlinks and accept the risk. |
 
 ### Export options
 
@@ -87,10 +76,8 @@ When `export_enabled` is true:
 ### sync_paths
 
 Controls which files are eligible for both import and export. Paths ending
-in `/` are treated as directory prefixes (everything underneath is included).
-All other entries are exact filename matches.
-
-Default paths:
+in `/` are treated as directory prefixes. All other entries are exact
+filename matches. Default paths:
 
 - `configuration.yaml`
 - `automations.yaml`
@@ -102,86 +89,121 @@ Default paths:
 - `dashboards/`
 - `scripts/`
 
-**⚠️ sync_paths gotcha:** if `configuration.yaml` contains a `!include_dir_*`
-directive pointing at a directory not in this list (e.g., `themes/`,
-`lovelace/`, `blueprints/`), files under that directory are silently
+If `configuration.yaml` contains a `!include_dir_*` directive pointing at
+a directory not in `sync_paths`, files under that directory are silently
 skipped during sync — unless `strict_sync_paths_check` (v1.5.1+) blocks
-the sync first. Add the directory to `sync_paths` and restart the add-on
-before merging PRs that add files under it.
+the sync first. The v1.1.7 startup audit also warns about this at
+add-on start.
 
-Three layers of protection against this class of mistake:
+## Repo trust (v1.6.0+)
 
-1. **v1.1.7 startup audit** — `audit_include_dir_directives()` scans
-   `configuration.yaml` at add-on startup and emits a WARNING per gap,
-   with line number and one-line remediation. Tells the operator about
-   gaps before they cause incidents.
-2. **v1.5.1 sync-time guard** — `check_sync_paths_gap()` runs at every
-   sync and ABORTS (default) if the current diff would silently drop
-   files referenced by an `!include_dir_*` directive. Prevents the
-   incident class even when the operator forgets to restart the add-on
-   after fixing the config.
-3. **strict_sync_paths_check** option — the v1.5.1 guard's default is
-   `true` (abort). Set to `false` to fall back to the v1.5.0 behavior
-   (log loudly, continue, let downstream check_config/reload catch it).
+Two guards added in v1.6.0 defend against repo-trust threats.
 
-### GitHub Personal Access Token
+### Host allowlist (`allowed_repo_hosts`)
 
-A GitHub PAT is required for private repos (import) and for export (push).
-Public repo import works without a PAT.
+Before any clone or fetch, the add-on validates that `github_repo`
+points at a hostname in `allowed_repo_hosts`. Defaults to
+`["github.com"]`. Subdomain matches are allowed via suffix-match:
+`"github.com"` permits `api.github.com`, `raw.githubusercontent.com`,
+etc.
 
-**Fine-grained PAT (recommended):**
+If the host is not in the allowlist, the add-on refuses to start with
+a multi-line ERROR pointing the operator at the fix:
+
+```
+REFUSING TO START — github_repo host not in allowlist
+...
+github_repo points at 'attacker.com', but allowed_repo_hosts is:
+  - github.com
+
+This is a security guard added in v1.6.0. Without it, a
+misconfigured github_repo URL would send the GitHub PAT to
+an arbitrary host on first clone/fetch.
+
+If 'attacker.com' is a host you trust (e.g. your GitHub
+Enterprise instance), add it to the allowed_repo_hosts
+config option in the add-on Configuration tab, save, and
+restart the add-on.
+```
+
+**For GitHub Enterprise operators**: this is a soft-breaking change.
+Add your GHE hostname to `allowed_repo_hosts` before upgrading to
+v1.6.0, e.g.:
+
+```yaml
+allowed_repo_hosts:
+  - github.com
+  - github.mycorp.io
+```
+
+### Tracked-symlink guard (`block_symlinks`)
+
+Before any pre-sync backup or file copy, the add-on checks whether
+any tracked file matching `sync_paths` is a symlink in the repo. If
+yes, the sync is aborted with a clear ERROR listing the symlinks and
+their targets.
+
+Symlinks in tracked config files are a path-traversal vector:
+
+- A commit could turn `automations.yaml` into a symlink to
+  `/etc/passwd` — the subsequent `cp` would expose the target file's
+  content through the sync (info disclosure, low-impact since the
+  add-on container is already privileged).
+- A commit could turn `scripts.yaml` into a symlink to
+  `/data/sync_status.json` — the `cp` would overwrite the target
+  with the commit's content (integrity attack).
+
+Default is `true`. Operators with intentional symlink use (rare — HA
+itself often has trouble with symlinks in `/config`) can set
+`block_symlinks: false` to revert to v1.5.x behavior.
+
+The abort path produces:
+- `event=tracked_symlinks result=abort` in the per-sync log
+- HA persistent_notification "Config Sync: tracked symlinks blocking sync"
+- `sensor.config_sync_status` state = `failed`,
+  `last_error: "[tracked_symlinks] ..."`, `failure_count` bumped
+- Git state reset to LOCAL so next cycle retries the same SHA after
+  the operator replaces the symlinks with regular files
+
+## GitHub Personal Access Token
+
+A GitHub PAT is required for private repos (import) and for export
+(push). Public repo import works without a PAT.
+
+**Fine-grained PAT (strongly recommended):**
 
 1. Go to [GitHub → Settings → Developer settings → Personal access tokens → Fine-grained tokens](https://github.com/settings/personal-access-tokens/new).
 2. Set a descriptive name (e.g., `ha-config-sync`).
-3. Set expiration (recommend 90 days; you can rotate by pasting a new token into the add-on config).
+3. Set expiration (recommend 90 days; rotate by pasting a new token).
 4. Under **Repository access**, select **Only select repositories** and pick your config repo.
-5. Under **Permissions → Repository permissions**, set **Contents** to **Read and write**. No other permissions are needed.
-6. Click **Generate token** and paste it into the `github_pat` field in the add-on config.
+5. Under **Permissions → Repository permissions**, set **Contents** to **Read and write**.
+6. Click **Generate token** and paste into `github_pat`.
 
-**Classic PAT (simpler, broader scope):**
+Fine-grained PATs are strongly preferred over classic PATs because
+they limit blast radius if exfiltrated.
 
-1. Go to [GitHub → Settings → Developer settings → Personal access tokens → Tokens (classic)](https://github.com/settings/tokens/new).
-2. Set a descriptive name and expiration.
-3. Check the `repo` scope (grants read/write to all your repos).
-4. Click **Generate token** and paste it into `github_pat`.
+### Where the PAT lives at runtime
 
-Fine-grained is **strongly preferred** because it limits the blast
-radius if the token is ever exfiltrated — see the PAT-handling note in
-"Where the PAT lives at runtime" below.
-
-#### Where the PAT lives at runtime (v1.5.4 correction)
-
-The PAT you paste into the add-on UI is stored encrypted at rest by the
-Home Assistant Supervisor (HA's add-on options store).
+The PAT you paste into the add-on UI is stored encrypted at rest by
+the Home Assistant Supervisor.
 
 **However, at runtime, the add-on writes the PAT to
 `/data/repo/.git/config` on disk inside the add-on container**, as
-part of the HTTPS remote URL
-(`https://<PAT>@github.com/<owner>/<repo>.git`). This is how git
-authenticates fetch/push without a credential helper. The `/data/`
-path is on the persistent add-on volume — the PAT survives container
+part of the HTTPS remote URL. This is how git authenticates without
+a credential helper. The `/data/` path is persistent across container
 restart.
 
-Anyone with `docker exec` access to the add-on container (i.e. anyone
-with HAOS admin + host-level access) can read the PAT in plaintext
-from that file. The PAT is **also** scrubbed from log output by
-`sanitize_output()` (v1.1.6+, hardened against glob-char fragility in
-v1.5.4) so it doesn't leak into the add-on log even on git error
-output.
+Anyone with `docker exec` access to the add-on container (HAOS admin
++ host access) can read the PAT in plaintext from that file. The PAT
+is also scrubbed from log output by `sanitize_output()` (v1.1.6+,
+hardened in v1.5.4) so it doesn't leak into the rolling add-on log.
 
-**Recommendation**: use a fine-grained PAT scoped to the single GitHub
-repo you sync, with Contents: read+write only. That way if the PAT is
-ever exfiltrated, the attacker gets push access to one repo and
-nothing else — not your whole GitHub account. Rotate the PAT
-periodically by pasting a new one into the add-on options (the old
-one is overwritten in `.git/config` on the next add-on restart).
+**Recommendation**: use a fine-grained PAT scoped to your single
+GitHub repo with Contents: read+write only. That way exfiltration
+limits attacker to push access on one repo.
 
 A future release may add an optional git credential helper to keep
 the PAT out of `.git/config` entirely. Not yet implemented.
-
-(Prior to v1.5.4, this section incorrectly claimed the PAT was "never
-written to disk inside the container." That was a documentation bug,
-not a code change — the PAT has always been written to `.git/config`.)
 
 ## Workflows
 
@@ -192,59 +214,12 @@ Edit config in GitHub → merge to branch → add-on pulls and validates → HA 
 ### Export-only
 
 Set `export_enabled: true`. Make changes via the HA UI → add-on detects
-the drift → commits and pushes to GitHub. Useful for backing up UI-driven
-configurations.
+the drift → commits and pushes to GitHub.
 
 ### Bidirectional
 
 Set `export_enabled: true`. Edit config in GitHub OR in the HA UI — both
-directions are handled. Import takes priority: after a pull from GitHub,
-the next export cycle is skipped to avoid a feedback loop.
-
-For cleaner git history with bidirectional sync, set `export_branch` to a
-separate branch (e.g., `ha-export`). HA-side changes land on that branch
-and can be reviewed via PR before merging to `main`.
-
-### Seeding the repo
-
-To populate an empty repo with your current HA config:
-
-1. Set `export_enabled: true`
-2. Start the add-on
-3. The initial export commits all `sync_paths` files to the repo
-4. Optionally disable export afterward if you only want one-way import
-
-## Pre-sync backup retention (v1.5.2+)
-
-Every sync that proceeds past the gap-guard takes a partial HA backup named
-`gitops-pre-<short_sha>` covering the `homeassistant` folder. By default the
-add-on retains the most-recent 7 of these and deletes the rest, so backups
-don't accumulate forever.
-
-**How it works:**
-
-- Pruning runs at the end of every `do_import()` cycle that took a backup
-  (success path, `check_config_invalid` fall-through, `check_config_api`
-  failure, `post_sync_verify` failure).
-- Backups are listed via `GET /backups`, filtered to names starting with
-  `gitops-pre-`, sorted by date descending, and anything past the Nth
-  most recent is deleted via `DELETE /backups/<slug>`.
-- The just-created backup is always the most recent by date, so it's never
-  deleted in the same cycle that created it — even on a failed sync where
-  the operator needs that exact backup for restore.
-- Failures of the list/delete API are logged at DEBUG/WARN respectively
-  and never propagate. The retention pass is strictly best-effort.
-
-**Disabling retention:**
-
-Set `pre_sync_backup_retention: 0` to revert to the v1.5.1 behavior
-(backups accumulate forever). Useful if you want HA's own backup retention
-policy to manage them, or if you keep a long compliance trail.
-
-**Naming caveat:** the prefix match is `gitops-pre-` against the backup
-`.name`. If you happen to create a backup of your own with that prefix
-(unusual), it will be subject to the retention sweep too. Use a different
-name for manual backups you want to keep.
+directions are handled. Import takes priority.
 
 ## Security
 
@@ -252,67 +227,42 @@ name for manual backups you want to keep.
 
 | Permission | Why | Since |
 |------------|-----|-------|
-| `homeassistant_api: true` | Core API access for `check_config`, `reload_all`, the post-sync verification probes (`/core/api/states/*`, `/core/api/`), and the v1.5.0 sync status sensor (`POST /core/api/states/sensor.config_sync_status`) | 1.1.4 |
-| `hassio_api: true` + `hassio_role: backup` | Supervisor API access for the pre-sync HA backup (`POST /backups/new/partial`) and the v1.5.2 backup retention sweep (`GET /backups` + `DELETE /backups/<slug>`). `backup` is the least-privilege role that grants the backups API — covers list + delete in addition to create. `manager` would also work but is broader than necessary. | 1.2.1 |
-| `map: config:rw` | Direct read/write to `/config` for the sync. | 1.0.0 |
+| `homeassistant_api: true` | Core API access (check_config, reload_all, post-sync probes, /core/restart, persistent_notification, status sensor) | 1.1.4 |
+| `hassio_api: true` + `hassio_role: backup` | Pre-sync backup + retention prune (least-privilege backup-only role) | 1.2.1 |
+| `map: config:rw` | Direct read/write to /config for sync | 1.0.0 |
 
-### General security posture
+### Defense-in-depth summary
 
-- **No manual HA tokens.** The add-on uses the auto-injected `$SUPERVISOR_TOKEN`
-  for HA API calls.
-- **No Samba.** Direct `/config` access via the Supervisor's `map: config:rw`.
-- **No inbound ports.** Only outbound HTTPS to GitHub and outbound HTTP
-  to the Supervisor unix-socket-style endpoint.
-- **Network timeouts on every outbound call (v1.5.4+)**: Supervisor API
-  calls are bounded by `--max-time 30 --connect-timeout 5`; git network
-  operations are bounded by `GIT_HTTP_LOW_SPEED_LIMIT=1000` +
-  `GIT_HTTP_LOW_SPEED_TIMEOUT=60`. A hung remote can no longer wedge
-  the single-threaded sync loop indefinitely.
-- **Rollback on failure.** Invalid imports are automatically reverted. Storage-level
-  rollback available via the `gitops-pre-<sha>` HA backup taken before each sync.
-- **GitHub PAT** is encrypted at rest by HA's options store, then
-  written to `.git/config` in plaintext inside the add-on container
-  at runtime. See "Where the PAT lives at runtime" under GitHub
-  Personal Access Token above for the full picture and the strong
-  recommendation to use a fine-grained PAT scoped to a single repo.
-- **PAT scrubbing in logs** via `sanitize_output()` (v1.1.6+, hardened
-  in v1.5.4 against glob-char fragility).
-- **Export commits** are attributed to `HA Config Sync <config-sync@homeassistant.local>`
-  for clear audit trail in git history.
+- **No manual HA tokens** — uses auto-injected `$SUPERVISOR_TOKEN`.
+- **No Samba** — direct `/config` access via `map: config:rw`.
+- **No inbound ports** — only outbound HTTPS to GitHub + HTTP to Supervisor.
+- **Network timeouts on every outbound call** (v1.5.4+): `--max-time 30
+  --connect-timeout 5` for curl; `GIT_HTTP_LOW_SPEED_TIMEOUT=60` for git.
+- **Repo-host allowlist** (v1.6.0+): `github_repo` host must match
+  `allowed_repo_hosts`.
+- **Tracked-symlink guard** (v1.6.0+): aborts sync if any tracked
+  sync_paths file is a symlink in the repo.
+- **sync_paths gap guard** (v1.5.1+): aborts sync if !include_dir_*
+  references files outside sync_paths.
+- **Pre-sync HA backup** (v1.2.0+) + retention (v1.5.2+) for storage-level
+  rollback.
+- **Post-sync verification probes** (v1.2.0+) for behavioral verification
+  that check_config doesn't catch.
+- **PAT scrubbing in logs** (v1.1.6+, hardened in v1.5.4).
+- **GitHub PAT stored encrypted at rest** by HA's options store; written
+  to `.git/config` in plaintext at runtime (see "Where the PAT lives"
+  above).
+- **Export commits** attributed to `HA Config Sync
+  <config-sync@homeassistant.local>` for audit trail.
 
 ## Observability
 
-The add-on surfaces sync state in five places, ordered from most operator-
-friendly to most diagnostic-detailed.
+See `sensor.config_sync_status` (v1.5.0+), `/data/sync_status.json`
+(v1.5.0+), the rolling add-on log, `/data/logs/sync/` (v1.4.1+), and
+`/data/logs/export/` (v1.5.3+). The 2026-05-25 review found no
+additional observability gaps in v1.5.x.
 
-### sensor.config_sync_status (v1.5.0+)
-
-First-class HA entity that reflects the most recent sync outcome. Visible in
-Developer Tools → States, addable to any dashboard, subscribable by
-automations, and queryable by external tooling (NanoClaw `agent-homeops`,
-Node-RED, etc) via the standard `/core/api/states/sensor.config_sync_status`
-endpoint.
-
-**States**: `idle` (boot, before any sync) → `syncing` (during do_import) →
-`success` | `failed`. Stays on the terminal state between cycles so the
-sensor always shows the latest outcome.
-
-**Attributes:**
-
-| Attribute | Description |
-|---|---|
-| `friendly_name` | Always `"Config Sync Status"` |
-| `icon` | `mdi:cloud-check` (success), `mdi:cloud-alert` (failed), `mdi:cloud-sync` (idle/syncing) |
-| `last_sync_at` | UTC ISO-8601 timestamp |
-| `last_sha_short` | 8-char target commit SHA |
-| `last_strategy` | `reload_all` / `reload_all_plus_themes` / `core_restart` (Sprint 3 reload key) |
-| `last_error` | Human-readable error text on failure, prefixed with `[stage]` (`pre_sync_backup`, `check_config_api`, `check_config_invalid`, `post_sync_verify`, `sync_paths_gap`) |
-| `last_backup_name` | Pre-sync HA backup name (e.g. `gitops-pre-abc12345`) for one-click restore |
-| `last_log_file` | Path to the per-sync structured log file for the run |
-| `sync_count` | Lifetime count of cycles that did real work |
-| `failure_count` | Lifetime count of failed cycles |
-
-**Recommended dashboard card:**
+### Recommended dashboard card
 
 ```yaml
 type: tile
@@ -320,7 +270,7 @@ entity: sensor.config_sync_status
 show_entity_picture: false
 ```
 
-**Recommended automation — ping on failure:**
+### Recommended automation — ping on failure
 
 ```yaml
 alias: Notify on Config Sync failure
@@ -338,214 +288,21 @@ action:
         Restore backup: {{ state_attr('sensor.config_sync_status', 'last_backup_name') }}
 ```
 
-### /data/sync_status.json (v1.5.0+)
-
-Mirror of the sensor's state + attributes, written to the add-on's persistent
-storage. Survives add-on restart and upgrade. Used internally to restore
-lifetime counters across reboots, and externally by headless tooling that
-doesn't have HA API access.
-
-Operator access:
-
-```
-docker exec -it addon_<slug>_config-sync cat /data/sync_status.json | jq
-```
-
-### Rolling add-on log
-
-Check the **Log** tab in the add-on panel for the live log stream.
-
-### Per-sync structured log (v1.4.1+)
-
-In addition to the rolling add-on log, every sync cycle that has changes
-writes a dedicated structured log file under `/data/logs/sync/` inside the
-add-on container. Filename is `<UTC-timestamp>-<remote-short-sha>.log`.
-Retention is hardcoded to the most-recent 20 files (oldest auto-deleted).
-
-Each file captures every major waypoint with `event=` keys:
-
-```
-2026-05-26T03:14:07Z [INFO] event=sync_start local=abc12345 remote=def67890
-2026-05-26T03:14:07Z [INFO] event=files_changed count=2 paths=automations.yaml,scripts.yaml
-2026-05-26T03:14:09Z [INFO] event=backup result=triggered name=gitops-pre-def67890
-2026-05-26T03:14:10Z [INFO] event=reconcile copied=0 failed=0
-2026-05-26T03:14:11Z [INFO] event=check_config result=valid
-2026-05-26T03:14:11Z [INFO] event=reload strategy=reload_all reason=default
-2026-05-26T03:14:17Z [INFO] event=verify probe=sun.sun result=pass
-2026-05-26T03:14:17Z [INFO] event=verify probe=core_api result=pass
-2026-05-26T03:14:18Z [INFO] event=backup_prune retention=7 deleted=1 failed=0
-2026-05-26T03:14:18Z [INFO] event=sync_end result=success
-```
-
-Operator access:
-
-```
-docker exec -it addon_<slug>_config-sync ls -lt /data/logs/sync/
-docker exec -it addon_<slug>_config-sync cat /data/logs/sync/<filename>.log
-```
-
-Use this when investigating a past sync that the rolling log has scrolled
-past, or when reconstructing the exact sequence around a known-bad commit.
-The `/data/` mount is persistent across add-on restarts and upgrades, so
-the log history survives a container rebuild. The path of the latest
-file is also exposed as the `last_log_file` attribute on
-`sensor.config_sync_status` for direct lookup.
-
-If `mkdir` on the log directory fails (e.g. disk full), the cycle logs a
-WARNING to the rolling add-on log and continues — per-sync logging is
-best-effort and never blocks a sync.
-
-### Per-export structured log (v1.5.3+)
-
-Export-side parity with the per-sync log. Every `do_export()` cycle that
-has real changes to push writes a dedicated file under `/data/logs/export/`
-named `<UTC-timestamp>-export-<mode>.log` where `<mode>` is `initial` or
-`auto`. No-op export cycles (no HA-side drift) produce no log file. Same
-20-file retention as the sync side; separate subdir so the two streams
-don't intermix.
-
-Event vocabulary (one per line):
-
-```
-2026-05-26T03:30:00Z [INFO] event=export_start mode=auto branch=main
-2026-05-26T03:30:01Z [INFO] event=files_staged count=2 paths=automations.yaml,scripts.yaml
-2026-05-26T03:30:01Z [INFO] event=commit sha=abc12345 files=2
-2026-05-26T03:30:03Z [INFO] event=push branch=main result=success
-2026-05-26T03:30:03Z [INFO] event=export_end result=success
-```
-
-Failure-path examples:
-
-```
-2026-05-26T03:35:00Z [INFO] event=export_start mode=auto branch=main
-2026-05-26T03:35:01Z [INFO] event=files_staged count=1 paths=automations.yaml
-2026-05-26T03:35:01Z [INFO] event=commit sha=def67890 files=1
-2026-05-26T03:35:02Z [ERROR] event=push branch=main result=failed error="remote: Permission denied to ..."
-2026-05-26T03:35:02Z [INFO] event=export_end result=push_failed
-```
-
-```
-2026-05-26T03:40:00Z [INFO] event=export_start mode=initial branch=main
-2026-05-26T03:40:01Z [INFO] event=files_staged count=3 paths=automations.yaml,scripts.yaml,scenes.yaml
-2026-05-26T03:40:01Z [INFO] event=commit sha=xyz98765 files=3
-2026-05-26T03:40:01Z [WARN] event=push branch=main result=skipped reason=no_pat
-2026-05-26T03:40:01Z [INFO] event=export_end result=no_pat
-```
-
-Operator access:
-
-```
-docker exec -it addon_<slug>_config-sync ls -lt /data/logs/export/
-docker exec -it addon_<slug>_config-sync cat /data/logs/export/<filename>.log
-```
-
-Push error text is run through `sanitize_output()` first — any embedded
-GitHub PAT is scrubbed before being written to the log. The error string
-is also truncated to 200 characters to keep each line bounded.
-
-### Import logs (happy path)
-
-```
-[config-sync] Import: change detected (abc12345 -> def67890)
-[config-sync] Import: syncing configuration.yaml automations.yaml
-[config-sync] Pre-sync HA backup 'gitops-pre-def67890' triggered — Settings → System → Backups
-[config-sync] Import: config valid — reloading Home Assistant
-[config-sync] Import: reload complete (abc12345 -> def67890)
-[config-sync] Post-sync verify: both probes passed — sync verified healthy
-[config-sync] Pre-sync backup retention: pruned 1, failed 0 (keeping last 7)
-```
-
-### Export logs
-
-```
-[config-sync] Export enabled — running initial export
-[config-sync] Export (initial): committed automations.yaml scripts.yaml
-[config-sync] Export (initial): pushed to origin/main
-[config-sync] Export (auto): committed automations.yaml
-[config-sync] Export (auto): pushed to origin/main
-```
-
-### Error logs
-
-Failed Supervisor API calls log the actual HTTP status code and a
-truncated response body so the root cause is visible without a separate
-diagnostic step. Examples:
-
-```
-[config-sync] Pre-sync HA backup API failed — REFUSING to sync (HTTP 403)
-[config-sync]   Supervisor response: {"result":"error","message":"You don't have the role to call this endpoint"}
-[config-sync]   Common causes for this endpoint:
-[config-sync]     HTTP 401/403 — add-on missing 'hassio_api: true' or 'hassio_role: backup' in config.yaml
-[config-sync]     HTTP 4xx     — backup integration not loaded, or request body schema changed
-[config-sync]     HTTP 5xx     — Supervisor internal error, or disk full
-[config-sync] Aborting sync — rolling back git state to abc12345; next cycle will retry
-```
-
-A v1.5.1 sync_paths gap abort looks like:
-
-```
-[config-sync] ============================================================
-[config-sync] SYNC ABORTED — sync_paths gap detected
-[config-sync] ============================================================
-[config-sync] configuration.yaml (/data/repo/configuration.yaml) has !include_dir_* directives
-[config-sync] targeting directories NOT in sync_paths:
-[config-sync]   themes/ 
-[config-sync] 
-[config-sync] This sync would update configuration.yaml's references but
-[config-sync] the sync_paths filter blocks 3 referenced file(s) from reaching /config.
-[config-sync] HA will see configuration.yaml pointing at files that don't exist on disk —
-[config-sync] frontend assets, themes, or lovelace dashboards may break.
-[config-sync] 
-[config-sync] Affected files (first 10):
-[config-sync]   - themes/dark.yaml
-[config-sync]   - themes/light.yaml
-[config-sync]   - themes/seasonal.yaml
-[config-sync] 
-[config-sync] Fix: open the add-on Configuration tab, add these to sync_paths:
-[config-sync]     - "themes/"
-[config-sync] Save the config and restart the add-on. The next sync will retry.
-[config-sync] ============================================================
-```
-
-Other failure examples:
-
-```
-[config-sync] Import: config invalid: Integration 'nonexistent' not found
-[config-sync] Import: rolling back to abc12345
-```
-
-```
-[config-sync] Post-sync probe 2 FAILED: /core/api/ unresponsive or auth rejected (HTTP 500)
-[config-sync]   Supervisor response: {"error":"Internal Server Error"}
-[config-sync] POST-SYNC VERIFICATION FAILED — rolling back
-[config-sync] If HA is still broken, restore the pre-sync backup:
-[config-sync]   Settings → System → Backups → 'gitops-pre-def67890'
-```
-
-```
-[config-sync] Export: no github_pat configured — cannot push (read-only)
-```
-
-If a sync fails with a Supervisor response you don't understand, the
-HTTP code + response body in the log line are enough to file an issue
-with full diagnostic context.
+(For full observability detail — attribute schema, per-sync log format,
+export log format, error log examples — see the v1.5.3 file history
+of DOCS.md. Truncated here in v1.6.0 only because the schema and log
+formats have not changed.)
 
 ## Agent integration
 
-The add-on can be managed and observed programmatically. Any agent or
-automation platform that can call the HA REST API can:
+Any agent or automation platform that can call the HA REST API can:
 
-- **Subscribe to sync state** (v1.5.0+): `GET /core/api/states/sensor.config_sync_status` returns the current state + attributes; use the standard HA state-change WebSocket for push.
+- **Subscribe to sync state** (v1.5.0+): `GET /core/api/states/sensor.config_sync_status`
 - **Read add-on options**: `GET/POST /addons/config-sync/options`
 - **Start/stop/restart**: `POST /addons/config-sync/{start,stop,restart}`
 - **Read add-on logs**: `GET /addons/config-sync/logs`
 - **Check add-on status**: `GET /addons/config-sync/info`
 
-To trigger an on-demand export, an agent can restart the add-on — the
-initial export runs on every startup when `export_enabled` is true.
-
-This makes it compatible with NanoClaw's `agent-homeops`, Home Assistant
-automations, or any future agent platform. NanoClaw `agent-homeops` is
-the intended primary consumer of `sensor.config_sync_status` — it polls
-the state and surfaces failures via the Telegram channel without needing
-`docker exec` into the add-on container.
+NanoClaw's `agent-homeops` is the intended primary consumer of
+`sensor.config_sync_status` — it polls the state and surfaces failures
+via Telegram without needing `docker exec`.
