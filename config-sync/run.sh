@@ -1197,6 +1197,14 @@ git config --global user.email "config-sync@homeassistant.local"
 # expands ${GH_CONFIG_SYNC_PAT} when git invokes the helper, so the
 # PAT never lands on disk. Compare with v1.5.x/v1.6.0 which embedded
 # the PAT directly in the HTTPS remote URL (persisted in .git/config).
+#
+# shellcheck disable=SC2016
+# (Single quotes are intentional and load-bearing here. The point of
+# this string is to store ${GH_CONFIG_SYNC_PAT} as a LITERAL in
+# .git/config so git's credential-helper shell expands it at
+# git-command time from the process environment — not bash at
+# config-write time. Double-quoting here would expand the PAT into
+# the literal config line and reintroduce the M3 finding.)
 GIT_CREDENTIAL_HELPER='!f() { echo username=x-access-token; echo "password=${GH_CONFIG_SYNC_PAT}"; }; f'
 
 # ── Initial clone ──────────────────────────────────────────────────
