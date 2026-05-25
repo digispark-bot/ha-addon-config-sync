@@ -3,7 +3,7 @@
 # Source the bashio library (HA add-on option parsing + logging)
 source /usr/lib/bashio/bashio.sh
 # ---------------------------------------------------------------
-# Config Sync (GitOps) — HA Supervisor Add-on  v1.4.0
+# Config Sync (GitOps) — HA Supervisor Add-on  v1.4.1
 #
 # Bidirectional sync:
 #   IMPORT — pull config from GitHub → backup HA → validate → reload → verify
@@ -78,6 +78,19 @@ SUPERVISOR_RESP_CODE_FILE="/tmp/.sup_resp_code"
 # state, not a backlog.
 NOTIFICATION_ID="config_sync_failure"
 
+# Per-sync structured-log location + retention. v1.4.1.
+# Writes go to /data/ which is the add-on's persistent storage —
+# survives restart AND add-on upgrade. NOT /config (would pollute HA's
+# tree) and NOT /share (would require widening filesystem permissions).
+# Operator access: `docker exec addon_config-sync ls /data/logs/sync/`.
+SYNC_LOG_DIR="/data/logs/sync"
+SYNC_LOG_MAX_FILES=20
+# Set per-cycle by sync_log_open(); cleared by sync_log_close(). When
+# empty, sync_log() is a no-op. This lets us drop sync_log calls into
+# helpers (e.g. post_sync_verify) without needing to plumb the file
+# path through arguments.
+SYNC_LOG_FILE=""
+
 # Default export branch to the sync branch if not set
 if [ -z "${EXPORT_BRANCH}" ]; then
     EXPORT_BRANCH="${BRANCH}"
@@ -117,6 +130,79 @@ path_allowed() {
         fi
     done
     return 1
+}
+
+# ────────────────────────────────────────────────────────────────────
+#  Per-sync structured log (v1.4.1)
+# ────────────────────────────────────────────────────────────────────
+# Each sync cycle that actually does work opens a dedicated file under
+# /data/logs/sync/ and records structured key=value events at every
+# major waypoint. Lets operators answer "what happened during that
+# failed sync at 03:47?" without tailing the live add-on log or hoping
+# the relevant lines haven't rotated out.
+#
+# Format (one event per line):
+#   <ISO-timestamp> [<level>] event=<name> key=value key=value ...
+#
+# Hardcoded retention: SYNC_LOG_MAX_FILES = 20 (matches sprint plan).
+# Pruning runs at close time, keeping the last 20 by mtime.
+# ────────────────────────────────────────────────────────────────────
+
+# Open a new per-sync log file. Called once per do_import cycle that
+# has syncable changes (before any backup/copy/reload work).
+#   $1 = LOCAL  sha (current /config state before the sync)
+#   $2 = REMOTE sha (target state being synced in)
+sync_log_open() {
+    local local_sha="$1" remote_sha="$2"
+    local fname_ts
+    # Filename-safe ISO format (no colons — some operator workflows
+    # mangle paths with colons; the in-line timestamp inside the log
+    # uses standard ISO).
+    fname_ts=$(date -u '+%Y-%m-%dT%H-%M-%SZ')
+    if ! mkdir -p "${SYNC_LOG_DIR}" 2>/dev/null; then
+        bashio::log.warning "sync_log: failed to create ${SYNC_LOG_DIR} — per-sync log disabled this cycle"
+        SYNC_LOG_FILE=""
+        return 0
+    fi
+    SYNC_LOG_FILE="${SYNC_LOG_DIR}/${fname_ts}-${remote_sha:0:8}.log"
+    sync_log INFO "event=sync_start local=${local_sha:0:8} remote=${remote_sha:0:8}"
+}
+
+# Append a structured event line to the current per-sync log file.
+# No-op if no log is open (i.e. called outside an active sync cycle,
+# or sync_log_open failed earlier).
+#   $1 = level (INFO / WARN / ERROR)
+#   $2+ = key=value tokens (caller responsible for formatting)
+sync_log() {
+    [ -z "${SYNC_LOG_FILE}" ] && return 0
+    local level="$1"
+    shift
+    local ts
+    ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+    # Append with fail-tolerant redirect — losing the log line shouldn't
+    # break the sync.
+    echo "${ts} [${level}] $*" >> "${SYNC_LOG_FILE}" 2>/dev/null || true
+}
+
+# Close the current per-sync log with a summary line and prune old
+# files to retention limit. Idempotent — safe to call from multiple
+# return paths.
+#   $1 = result (success / failure)
+sync_log_close() {
+    [ -z "${SYNC_LOG_FILE}" ] && return 0
+    local result="${1:-unknown}"
+    sync_log INFO "event=sync_end result=${result}"
+    SYNC_LOG_FILE=""
+    # Prune oldest beyond SYNC_LOG_MAX_FILES. Pure mtime sort; no parsing
+    # of filenames so it survives clock changes.
+    if [ -d "${SYNC_LOG_DIR}" ]; then
+        # shellcheck disable=SC2012  # ls -t is the right tool here
+        ls -1t "${SYNC_LOG_DIR}" 2>/dev/null \
+            | tail -n +$((SYNC_LOG_MAX_FILES + 1)) \
+            | while IFS= read -r old; do
+                rm -f "${SYNC_LOG_DIR}/${old}" 2>/dev/null || true
+            done
+    fi
 }
 
 # Call the Supervisor API and capture both the response body AND the
@@ -320,9 +406,11 @@ ha_backup_pre_sync() {
         bashio::log.error "    HTTP 401/403 — add-on missing 'hassio_api: true' or 'hassio_role: backup' in config.yaml"
         bashio::log.error "    HTTP 4xx     — backup integration not loaded, or request body schema changed"
         bashio::log.error "    HTTP 5xx     — Supervisor internal error, or disk full"
+        sync_log ERROR "event=backup name=${name} result=failed http_code=$(cat "${SUPERVISOR_RESP_CODE_FILE}" 2>/dev/null || echo ???)"
         return 1
     fi
     bashio::log.info "Pre-sync HA backup '${name}' triggered — Settings → System → Backups"
+    sync_log INFO "event=backup name=${name} result=triggered"
     return 0
 }
 
@@ -346,16 +434,20 @@ post_sync_verify() {
     if ! supervisor_api GET "/core/api/states/sun.sun" > /dev/null; then
         log_supervisor_error "Post-sync probe 1 FAILED: sun.sun unreachable"
         bashio::log.error "  HA may be down, restarting, or its state machine isn't serving."
+        sync_log ERROR "event=verify probe=sun.sun result=fail http_code=$(cat "${SUPERVISOR_RESP_CODE_FILE}" 2>/dev/null || echo ???)"
         return 1
     fi
+    sync_log INFO "event=verify probe=sun.sun result=pass"
 
     bashio::log.debug "Post-sync verify: probe 2/2 — /core/api/ auth + responsiveness"
     if ! supervisor_api GET "/core/api/" > /dev/null; then
         log_supervisor_error "Post-sync probe 2 FAILED: /core/api/ unresponsive or auth rejected"
         bashio::log.error "  Possible causes: auth provider broken, frontend assets missing,"
         bashio::log.error "  integration crashed during reload. THIS IS THE 2026-05-25 BUG CLASS."
+        sync_log ERROR "event=verify probe=core_api result=fail http_code=$(cat "${SUPERVISOR_RESP_CODE_FILE}" 2>/dev/null || echo ???)"
         return 1
     fi
+    sync_log INFO "event=verify probe=core_api result=pass"
 
     bashio::log.info "Post-sync verify: both probes passed — sync verified healthy"
     return 0
@@ -415,6 +507,7 @@ reconcile_tracked_files() {
     if [ "${reconcile_count}" -gt 0 ] || [ "${cp_failure_count}" -gt 0 ]; then
         bashio::log.info "Reconcile: ${reconcile_count} missing file(s) copied, ${cp_failure_count} failure(s)"
     fi
+    sync_log INFO "event=reconcile copied=${reconcile_count} failed=${cp_failure_count}"
     return 0
 }
 
@@ -692,7 +785,13 @@ do_import() {
         return 0
     fi
 
+    # Open the per-sync structured log file for this cycle. All
+    # subsequent sync_log calls land in this file. Closed at every
+    # return point below.
+    sync_log_open "${LOCAL}" "${REMOTE}"
+
     bashio::log.info "Import: syncing $(echo "${CHANGED}" | tr '\n' ' ')"
+    sync_log INFO "event=files_changed count=$(echo "${CHANGED}" | wc -l | tr -d ' ') paths=$(echo "${CHANGED}" | tr '\n' ',' | sed 's/,$//')"
 
     # ── Pre-sync HA backup (storage-level safety net) ────────────────
     # If this fails, we MUST roll back the git merge so the next cycle
@@ -704,6 +803,7 @@ do_import() {
         notify_sync_failure \
             "Config Sync: pre-sync backup failed" \
             "The add-on could not take an HA backup before syncing ${REMOTE:0:8}. Sync aborted and will retry next cycle. Check the add-on log for the Supervisor error response."
+        sync_log_close failure
         return 1
     fi
 
@@ -755,12 +855,15 @@ do_import() {
         notify_sync_failure \
             "Config Sync: check_config API unreachable" \
             "Tried to validate ${REMOTE:0:8} but the Supervisor check_config endpoint did not respond. Sync rolled back to ${LOCAL:0:8}. Check the add-on log for the Supervisor error response."
+        sync_log ERROR "event=check_config result=api_failed http_code=$(cat "${SUPERVISOR_RESP_CODE_FILE}" 2>/dev/null || echo ???)"
+        sync_log_close failure
         return 1
     }
 
     VALID=$(echo "${CHECK_RESULT}" | jq -r '.result // empty' 2>/dev/null)
 
     if [ "${VALID}" = "valid" ]; then
+        sync_log INFO "event=check_config result=valid"
         # ── Reload-strategy selection (Sprint 3) ─────────────────────
         # Pick the right way to apply the new config based on what changed:
         #   - lovelace touched  → /core/restart (re-registers dashboards)
@@ -775,28 +878,35 @@ do_import() {
             reload_strategy="/core/restart"
             reload_settle=$((POST_SYNC_SETTLE + RESTART_EXTRA_SETTLE))
             bashio::log.info "Import: configuration.yaml lovelace block changed — calling /core/restart (reload_all does NOT re-register dashboards)"
+            sync_log INFO "event=reload strategy=core_restart reason=lovelace_changed"
             if ! supervisor_api POST "/core/api/services/homeassistant/restart" > /dev/null; then
                 log_supervisor_error "/core/restart API call failed"
                 bashio::log.warning "  Manual HA restart may be needed for lovelace dashboards to register."
+                sync_log WARN "event=reload_call result=failed strategy=core_restart"
             fi
         elif sync_touches_themes; then
             reload_strategy="reload_all + frontend.reload_themes"
             reload_settle="${POST_SYNC_SETTLE}"
             bashio::log.info "Import: themes/ files changed — calling reload_all + frontend.reload_themes"
+            sync_log INFO "event=reload strategy=reload_all_plus_themes reason=themes_changed"
             if ! supervisor_api POST "/core/api/services/homeassistant/reload_all" > /dev/null; then
                 log_supervisor_error "reload_all API call failed — HA may not have picked up the changes"
                 bashio::log.warning "  Continuing to post-sync probes; they will catch any actual breakage."
+                sync_log WARN "event=reload_call result=failed strategy=reload_all"
             fi
             if ! supervisor_api POST "/core/api/services/frontend/reload_themes" > /dev/null; then
                 log_supervisor_error "frontend.reload_themes API call failed — new themes may not activate until next HA restart"
+                sync_log WARN "event=reload_call result=failed strategy=reload_themes"
             fi
         else
             reload_strategy="reload_all"
             reload_settle="${POST_SYNC_SETTLE}"
             bashio::log.info "Import: config valid — reloading Home Assistant"
+            sync_log INFO "event=reload strategy=reload_all reason=default"
             if ! supervisor_api POST "/core/api/services/homeassistant/reload_all" > /dev/null; then
                 log_supervisor_error "reload_all API call failed — HA may not have picked up the changes"
                 bashio::log.warning "  Continuing to post-sync probes; they will catch any actual breakage."
+                sync_log WARN "event=reload_call result=failed strategy=reload_all"
             fi
         fi
         bashio::log.info "Import: ${reload_strategy} complete (${LOCAL:0:8} -> ${REMOTE:0:8})"
@@ -837,6 +947,7 @@ do_import() {
             notify_sync_failure \
                 "Config Sync: post-sync verification failed" \
                 "Applied ${reload_strategy} for ${REMOTE:0:8} but HA failed health probes afterward. Files rolled back to ${LOCAL:0:8}. **If HA is still broken, restore backup \`gitops-pre-${REMOTE:0:8}\`** via Settings → System → Backups. Check the add-on log for the failed probe details."
+            sync_log_close failure
             return 1
         fi
 
@@ -846,6 +957,7 @@ do_import() {
         # Healthy sync completed — dismiss any prior failure notification
         # so the operator's UI is clean.
         notify_sync_recovered
+        sync_log_close success
     else
         ERROR_MSG=$(echo "${CHECK_RESULT}" | jq -r '.errors // .message // "unknown error"' 2>/dev/null)
         bashio::log.error "Import: config invalid: ${ERROR_MSG}"
@@ -859,6 +971,11 @@ do_import() {
         notify_sync_failure \
             "Config Sync: check_config rejected the new config" \
             "HA's check_config returned invalid for ${REMOTE:0:8}: ${ERROR_MSG}. Files rolled back to ${LOCAL:0:8}; sync will keep retrying. Fix the config in the repo and push again."
+        # check_config-invalid path falls through to the cleanup below
+        # then returns 0 from do_import (we recovered cleanly). Per-sync
+        # log records the failure outcome.
+        sync_log ERROR "event=check_config result=invalid"
+        sync_log_close failure
     fi
 
     # Clean old rollback dirs (keep last 5)

@@ -1,5 +1,36 @@
 # Changelog
 
+## 1.4.1
+
+Sprint 3 P1 from the hardening plan (see issue #9): per-sync structured log
+file so operators can reconstruct exactly what happened during any past
+sync without scraping the rolling add-on log.
+
+- **Feature (Sprint 3 P1)**: Each sync cycle that has changes writes a
+  dedicated log file under `/data/logs/sync/` named
+  `<UTC-timestamp>-<remote-short-sha>.log`. Captures every major
+  waypoint with structured `event=` keys: `sync_start`, `files_changed`,
+  `backup`, `reconcile`, `check_config`, `reload`, `verify`, `sync_end`.
+  Lines are timestamped UTC ISO-8601 and prefixed with a level tag
+  (INFO / WARN / ERROR).
+- **New helpers**: `sync_log_open()` creates the file and writes the
+  `sync_start` line. `sync_log LEVEL msg` appends one line. `sync_log_close
+  RESULT` writes the `sync_end` line and rotates the directory down to the
+  most-recent 20 files. All three are no-ops if the log file path is unset,
+  so cycles with no changes produce no log noise.
+- **Storage**: `/data/` is the add-on's persistent storage (survives
+  restart + upgrade). Logs are container-internal — operator access is via
+  `docker exec -it addon_<slug>_config-sync ls -lt /data/logs/sync/`.
+  Hardcoded retention of 20 files (oldest auto-deleted) keeps the
+  footprint bounded; typical file size is ~2 KB so worst-case retained
+  log volume is ~40 KB.
+- **Resilience**: If `mkdir` on the log directory fails, the cycle logs a
+  WARNING and continues — per-sync logging is best-effort and never blocks
+  a sync. Per-line writes use `>> file 2>/dev/null || true` so a transient
+  IO error doesn't crash the loop.
+- **No new config options**; no schema changes. Operators who don't want
+  per-sync logs can simply ignore the directory (it's tiny).
+
 ## 1.4.0
 
 Sprint 3 P0 from the hardening plan (see issue #9): pick the right
