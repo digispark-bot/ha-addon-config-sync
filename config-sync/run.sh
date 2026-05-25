@@ -3,7 +3,7 @@
 # Source the bashio library (HA add-on option parsing + logging)
 source /usr/lib/bashio/bashio.sh
 # ---------------------------------------------------------------
-# Config Sync (GitOps) — HA Supervisor Add-on  v1.5.3
+# Config Sync (GitOps) — HA Supervisor Add-on  v1.5.4
 #
 # Bidirectional sync:
 #   IMPORT — pull config from GitHub → backup HA → validate → reload → verify
@@ -16,6 +16,12 @@ set -euo pipefail
 
 # Ensure HOME is set (needed by git config --global)
 export HOME="${HOME:-/root}"
+
+# Git network timeouts (v1.5.4, H2). Abort git fetch/push/clone if the
+# connection stalls (<1KB/s for 60s). Without these, a flaky GitHub
+# connection can hang the entire single-threaded sync loop forever.
+export GIT_HTTP_LOW_SPEED_LIMIT=1000
+export GIT_HTTP_LOW_SPEED_TIMEOUT=60
 
 # ── Read add-on options ──────────────────────────────────────────────────
 REPO=$(bashio::config 'github_repo')
@@ -95,6 +101,14 @@ LAST_EXPORT_TS="/data/.last-export-ts"
 SUPERVISOR_RESP_BODY_FILE="/tmp/.sup_resp_body"
 SUPERVISOR_RESP_CODE_FILE="/tmp/.sup_resp_code"
 
+# Supervisor API timeouts (v1.5.4, H1). Without these, a hung
+# Supervisor would wedge the single-threaded sync loop forever.
+# 30s max per call is comfortable for /backups/new/partial (which
+# returns when HA accepts the job, not when the backup completes)
+# and tight enough for the per-cycle health probes.
+SUPERVISOR_API_TIMEOUT=30
+SUPERVISOR_API_CONNECT_TIMEOUT=5
+
 # Persistent-notification ID used by notify_sync_failure / _recovered.
 # Singleton — every failure updates the same notification, every recovery
 # dismisses it. Operators see one notification reflecting the LATEST sync
@@ -144,10 +158,15 @@ fi
 # ── Helpers ────────────────────────────────────────────────────────
 
 # Sanitize PAT from log output to avoid leaking credentials.
+# v1.5.4 (M5): quote the search side of the pattern substitution so
+# glob characters in the PAT (* ? [ ]) are matched literally rather
+# than as patterns. Current GitHub PAT format doesn't use glob chars,
+# but if it ever does, a non-quoted form would silently fail to scrub
+# the PAT and leak it into the log.
 sanitize_output() {
     local text="$1"
     if [ -n "${PAT}" ]; then
-        echo "${text//${PAT}/***}"
+        echo "${text//"${PAT}"/***}"
     else
         echo "${text}"
     fi
@@ -489,12 +508,18 @@ status_mark_failure() {
 #     read them after the call returns.
 #   - Returns 0 on HTTP 2xx, 1 on non-2xx HTTP response (e.g. 401/403/404/500),
 #     2 on transport error (curl couldn't connect).
+#   - v1.5.4 (H1): hard-bounded by SUPERVISOR_API_TIMEOUT (default 30s)
+#     and SUPERVISOR_API_CONNECT_TIMEOUT (default 5s). Without these,
+#     a hung Supervisor would wedge the single-threaded sync loop.
 #
 # Callers that want a diagnostic log line on failure should call
 # log_supervisor_error after a non-zero return.
 supervisor_api() {
     local method="$1" endpoint="$2" body="${3:-}"
-    local -a args=(-s -o "${SUPERVISOR_RESP_BODY_FILE}" -X "${method}"
+    local -a args=(-s
+                   --max-time "${SUPERVISOR_API_TIMEOUT}"
+                   --connect-timeout "${SUPERVISOR_API_CONNECT_TIMEOUT}"
+                   -o "${SUPERVISOR_RESP_BODY_FILE}" -X "${method}"
                    "http://supervisor${endpoint}"
                    -H "Authorization: Bearer ${SUPERVISOR_TOKEN}"
                    -H "Content-Type: application/json"
@@ -510,7 +535,8 @@ supervisor_api() {
 
     local code
     if ! code=$(curl "${args[@]}" 2>/dev/null); then
-        # Transport failure — couldn't reach Supervisor at all.
+        # Transport failure — couldn't reach Supervisor at all (or
+        # timed out per SUPERVISOR_API_TIMEOUT).
         echo "000" > "${SUPERVISOR_RESP_CODE_FILE}"
         return 2
     fi
@@ -541,8 +567,8 @@ log_supervisor_error() {
     body=$(head -c 500 "${SUPERVISOR_RESP_BODY_FILE}" 2>/dev/null | tr -d '\n' | tr -d '\r')
 
     if [ "${code}" = "000" ]; then
-        bashio::log.error "${prefix} (no response — Supervisor unreachable)"
-        bashio::log.error "  Probable cause: add-on networking down, or 'http://supervisor' DNS failure"
+        bashio::log.error "${prefix} (no response — Supervisor unreachable or timed out after ${SUPERVISOR_API_TIMEOUT}s)"
+        bashio::log.error "  Probable cause: add-on networking down, 'http://supervisor' DNS failure, or Supervisor hung"
     elif [ -n "${body}" ]; then
         bashio::log.error "${prefix} (HTTP ${code})"
         bashio::log.error "  Supervisor response: ${body}"
@@ -1000,7 +1026,10 @@ if [ ! -d "${REPO_DIR}/.git" ]; then
     bashio::log.info "First run — cloning ${REPO} (branch: ${BRANCH})"
     CLONE_URL="${REPO}"
     if [ -n "${PAT}" ]; then
-        CLONE_URL=$(echo "${REPO}" | sed "s|https://|https://${PAT}@|")
+        # v1.5.4 (M4): bash parameter expansion replaces sed.
+        # sed delimiter "|" would break if PAT ever contained |, &, or /;
+        # bash ${var/pattern/repl} substitutes literally, no fork to sed.
+        CLONE_URL="${REPO/https:\/\//https:\/\/${PAT}@}"
     fi
     git clone --branch "${BRANCH}" --single-branch "${CLONE_URL}" "${REPO_DIR}"
     bashio::log.info "Clone complete"
@@ -1008,7 +1037,8 @@ fi
 
 # Ensure remote URL has current PAT
 if [ -n "${PAT}" ]; then
-    AUTH_URL=$(echo "${REPO}" | sed "s|https://|https://${PAT}@|")
+    # v1.5.4 (M4): bash parameter expansion replaces sed. See CLONE_URL above.
+    AUTH_URL="${REPO/https:\/\//https:\/\/${PAT}@}"
     git -C "${REPO_DIR}" remote set-url origin "${AUTH_URL}"
 else
     git -C "${REPO_DIR}" remote set-url origin "${REPO}"
@@ -1056,7 +1086,7 @@ stage_config_to_repo() {
                 # of type due to operator precedence).
                 while IFS= read -r src; do
                     [ -z "${src}" ] && continue
-                    rel="${src#${CONFIG_DIR}/}"
+                    rel="${src#"${CONFIG_DIR}"/}"
                     mkdir -p "${REPO_DIR}/$(dirname "${rel}")"
                     if ! cmp -s "${src}" "${REPO_DIR}/${rel}" 2>/dev/null; then
                         cp "${src}" "${REPO_DIR}/${rel}"
