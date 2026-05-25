@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.3.1
+
+Sprint 2 P1 follow-up to v1.3.0 — surface sync failures in the HA UI so
+operators don't have to tail the add-on log to notice problems.
+
+- **Feature**: Persistent notification in the HA UI when a sync fails.
+  Single notification (id: `config_sync_failure`) updates on each new
+  failure and auto-dismisses on the next successful sync. Operators see
+  exactly one notification reflecting the LATEST sync state.
+- **New option**: `notify_on_failure: bool` (default `true`). Set to
+  `false` for headless deployments where UI clutter is unwanted.
+- **Wired into all failure paths**:
+  - Pre-sync backup API failure → "Config Sync: pre-sync backup failed"
+  - `check_config` API unreachable → "Config Sync: check_config API unreachable"
+  - `check_config` returned invalid → "Config Sync: check_config rejected the new config"
+  - Post-sync verification failure → "Config Sync: post-sync verification failed" (includes the named backup to restore)
+- **New helpers**: `notify_sync_failure()` + `notify_sync_recovered()`
+  use `jq` to safely build the JSON body (handles quotes, newlines,
+  backslashes in error messages without breakage). Notification API
+  failures are logged WARN but don't cascade.
+- No schema-breaking change; `notify_on_failure` defaults to true so
+  existing deployments get the feature automatically on update.
+
 ## 1.3.0
 
 Sprint 2 of the hardening plan (see issue #9): eliminate silent and
