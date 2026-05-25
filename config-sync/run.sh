@@ -3,7 +3,7 @@
 # Source the bashio library (HA add-on option parsing + logging)
 source /usr/lib/bashio/bashio.sh
 # ---------------------------------------------------------------
-# Config Sync (GitOps) — HA Supervisor Add-on  v1.5.0
+# Config Sync (GitOps) — HA Supervisor Add-on  v1.5.1
 #
 # Bidirectional sync:
 #   IMPORT — pull config from GitHub → backup HA → validate → reload → verify
@@ -52,6 +52,17 @@ fi
 RESTART_ON_LOVELACE_CHANGE=$(bashio::config 'restart_on_lovelace_change')
 if [ -z "${RESTART_ON_LOVELACE_CHANGE}" ]; then
     RESTART_ON_LOVELACE_CHANGE="true"
+fi
+
+# Whether to ABORT syncs that would silently drop files referenced by
+# !include_dir_* directives in configuration.yaml. Default: true
+# (Sprint 4 P1, v1.5.1). When false, the gap is logged loudly at ERROR
+# but the sync proceeds with the files dropped (the v1.5.0 behavior).
+# Operators with intentional layout choices that need this off can
+# flip it to false; default protects against the 2026-05-25 class.
+STRICT_SYNC_PATHS_CHECK=$(bashio::config 'strict_sync_paths_check')
+if [ -z "${STRICT_SYNC_PATHS_CHECK}" ]; then
+    STRICT_SYNC_PATHS_CHECK="true"
 fi
 
 # Extra settle seconds added to POST_SYNC_SETTLE when we used /core/restart
@@ -517,6 +528,9 @@ notify_sync_recovered() {
 # file:line and a one-line remediation. No-op if configuration.yaml
 # is unreadable.
 #
+# Complemented by check_sync_paths_gap() (v1.5.1) which runs the same
+# style of check at EVERY sync and ABORTS the sync (vs warning-only).
+#
 # See: GitHub issue #3, and the JLay2026/nanoclaw-zimaos#50 incident.
 audit_include_dir_directives() {
     local cfg="${CONFIG_DIR}/configuration.yaml"
@@ -549,6 +563,130 @@ audit_include_dir_directives() {
     else
         bashio::log.warning "audit: ${found_gaps} sync_paths gap(s) detected — see WARNINGs above"
     fi
+}
+
+# ────────────────────────────────────────────────────────────────────
+#  sync_paths gap guard at sync time (v1.5.1, Sprint 4 P1)
+# ────────────────────────────────────────────────────────────────────
+# Checks whether THIS sync would silently drop files referenced by
+# !include_dir_* directives in configuration.yaml. Catches the
+# 2026-05-25 incident class structurally:
+#
+#   - configuration.yaml has `themes: !include_dir_merge_named themes/`
+#   - themes/ is NOT in sync_paths (the gap)
+#   - PR adds themes/*.yaml files
+#   - Without this guard, the sync silently drops the themes/ files
+#     (allowlist-correct), configuration.yaml references files HA
+#     can't find on disk, frontend breaks
+#
+# Complementary to v1.1.7's audit_include_dir_directives() which only
+# runs at add-on startup. A PR can land between add-on restarts and
+# slip through that audit — this guard enforces at every sync.
+#
+# Returns 0 if no blocking gap, 1 if a gap should abort this sync.
+# When strict_sync_paths_check=false (operator override), emits the
+# same diagnostic ERROR but returns 0 (warning-only, v1.5.0 behavior).
+check_sync_paths_gap() {
+    # Pick the configuration.yaml to audit:
+    #   - if it's in this sync's CHANGED list, use the incoming repo version
+    #   - else use the currently-active /config version
+    # Either way, the !include_dir_* directives in that file determine
+    # which files HA expects to find on disk after the sync lands.
+    local cfg
+    if echo "${CHANGED}" | grep -qx 'configuration.yaml'; then
+        cfg="${REPO_DIR}/configuration.yaml"
+    elif [ -r "${CONFIG_DIR}/configuration.yaml" ]; then
+        cfg="${CONFIG_DIR}/configuration.yaml"
+    else
+        # No configuration.yaml to audit, and no include_dir_* directives
+        # to satisfy without one. Nothing to guard.
+        return 0
+    fi
+
+    # Build the list of !include_dir_* target directories (normalized
+    # with trailing slash for path_allowed probing).
+    local include_dirs=()
+    while IFS= read -r line; do
+        local arg norm
+        arg=$(echo "${line}" | sed -E 's/.*!include_dir_(named|list|merge_named|merge_list)[[:space:]]+"?([^"[:space:]#]+)"?.*/\2/')
+        norm="${arg%/}/"
+        include_dirs+=("${norm}")
+    done < <(grep -E '!include_dir_(named|list|merge_named|merge_list)[[:space:]]+\S+' "${cfg}" 2>/dev/null || true)
+
+    if [ "${#include_dirs[@]}" -eq 0 ]; then
+        return 0
+    fi
+
+    # For each include_dir NOT in sync_paths, check if any file in this
+    # sync's diff (CHANGED_ALL — broader set, includes already-skipped
+    # files) lies under it. Collect (dir, file) pairs for the report.
+    local gap_dirs=()
+    local gap_files=()
+    for d in "${include_dirs[@]}"; do
+        # Probe path_allowed with a synthetic file inside d. The synthetic
+        # suffix keeps us from accidentally matching a sync_paths entry
+        # whose name happens to share a prefix with d.
+        if path_allowed "${d}_audit_probe.yaml"; then
+            continue
+        fi
+        while IFS= read -r f; do
+            [ -z "${f}" ] && continue
+            if [[ "${f}" == "${d}"* ]]; then
+                gap_dirs+=("${d}")
+                gap_files+=("${f}")
+            fi
+        done <<< "${CHANGED_ALL}"
+    done
+
+    if [ "${#gap_dirs[@]}" -eq 0 ]; then
+        return 0
+    fi
+
+    # Dedupe directories for the report.
+    local unique_dirs_str
+    unique_dirs_str=$(printf '%s\n' "${gap_dirs[@]}" | sort -u | tr '\n' ' ')
+
+    bashio::log.error "============================================================"
+    if [ "${STRICT_SYNC_PATHS_CHECK}" = "true" ]; then
+        bashio::log.error "SYNC ABORTED — sync_paths gap detected"
+    else
+        bashio::log.error "SYNC_PATHS GAP DETECTED (strict_sync_paths_check=false — continuing)"
+    fi
+    bashio::log.error "============================================================"
+    bashio::log.error "configuration.yaml (${cfg}) has !include_dir_* directives"
+    bashio::log.error "targeting directories NOT in sync_paths:"
+    bashio::log.error "  ${unique_dirs_str}"
+    bashio::log.error ""
+    bashio::log.error "This sync would update configuration.yaml's references but"
+    bashio::log.error "the sync_paths filter blocks ${#gap_files[@]} referenced file(s)"
+    bashio::log.error "from reaching /config. HA will see configuration.yaml pointing"
+    bashio::log.error "at files that don't exist on disk — frontend assets, themes,"
+    bashio::log.error "or lovelace dashboards may break."
+    bashio::log.error ""
+    bashio::log.error "Affected files (first 10):"
+    local i=0
+    for f in "${gap_files[@]}"; do
+        bashio::log.error "  - ${f}"
+        i=$((i + 1))
+        if [ "${i}" -ge 10 ]; then
+            if [ "${#gap_files[@]}" -gt 10 ]; then
+                bashio::log.error "  ... (${#gap_files[@]} total, list truncated)"
+            fi
+            break
+        fi
+    done
+    bashio::log.error ""
+    bashio::log.error "Fix: open the add-on Configuration tab, add these to sync_paths:"
+    while IFS= read -r d; do
+        bashio::log.error "    - \"${d}\""
+    done < <(printf '%s\n' "${gap_dirs[@]}" | sort -u)
+    bashio::log.error "Save the config and restart the add-on. The next sync will retry."
+    bashio::log.error "============================================================"
+
+    if [ "${STRICT_SYNC_PATHS_CHECK}" = "true" ]; then
+        return 1
+    fi
+    return 0
 }
 
 # Trigger a partial HA backup via the Supervisor API before applying
@@ -972,6 +1110,28 @@ do_import() {
     # so HA dashboards / automations see the in-progress state. Done
     # AFTER sync_log_open so the last_log_file attribute is populated.
     status_mark_syncing "${REMOTE}"
+
+    # ── sync_paths gap guard (v1.5.1, Sprint 4 P1) ────────────────────
+    # Abort BEFORE any backup or filesystem write if this sync would
+    # silently drop files referenced by configuration.yaml's
+    # !include_dir_* directives. Catches the 2026-05-25 incident class
+    # at sync time (vs the v1.1.7 startup-only warning). Honors the
+    # strict_sync_paths_check config option; when false, the check
+    # emits the same ERROR but returns 0 and the sync continues.
+    if ! check_sync_paths_gap; then
+        sync_log ERROR "event=sync_paths_gap result=abort"
+        notify_sync_failure \
+            "Config Sync: sync_paths gap blocking sync" \
+            "configuration.yaml references files under directories not in sync_paths, and this sync would silently drop them. See add-on log for the missing directories and a copy-paste fix (add them to sync_paths and restart the add-on). Sync aborted; will keep retrying."
+        status_mark_failure "${REMOTE}" "sync_paths_gap" \
+            "configuration.yaml references files under directories not in sync_paths; sync aborted to prevent silent file drop. See add-on log for the fix recipe." \
+            ""
+        sync_log_close failure
+        # Roll back git state so the next cycle retries the same SHA
+        # once the operator has added the missing directories to sync_paths.
+        git reset --hard "${LOCAL}"
+        return 1
+    fi
 
     # Deterministic backup name — also referenced by failure paths
     # in the status_mark_failure attribute payload.
