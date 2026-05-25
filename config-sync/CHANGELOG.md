@@ -1,5 +1,73 @@
 # Changelog
 
+## 1.6.0
+
+Sprint 5 P1 from the 2026-05-25 code-and-security review. Two
+structural defenses against repo-trust threats, plus the addition of
+CI (shellcheck + docker build smoke test). Minor version bump because
+the `allowed_repo_hosts` default is a soft-breaking change for any
+GitHub Enterprise operator.
+
+- **Feature (Review M7)**: New `check_repo_host_allowed()` startup
+  guard validates `github_repo` host against the new
+  `allowed_repo_hosts` config option (default `["github.com"]`).
+  Subdomain matches are allowed via suffix-match — `"github.com"`
+  permits `api.github.com`, `raw.githubusercontent.com`, etc. Refuses
+  to start with a multi-line ERROR if the URL points outside the
+  allowlist.
+
+  Defends against the case where a misconfigured or social-engineered
+  `github_repo` URL would silently embed the PAT and send it on first
+  clone/fetch — prior versions trusted whatever the operator pasted
+  into the option.
+
+  **Breaking change for GitHub Enterprise operators**: GHE users must
+  add their hostname to `allowed_repo_hosts` before upgrading to
+  v1.6.0, or the add-on will refuse to start. The ERROR message in the
+  log is explicit and tells the operator exactly what to fix.
+
+- **Feature (Review M6)**: New `check_no_tracked_symlinks()` sync-time
+  guard. Runs in `do_import()` after `check_sync_paths_gap` and
+  before pre-sync backup. Aborts the sync if any tracked file matching
+  `sync_paths` is a symlink in `/data/repo/`.
+
+  Defends against the case where a malicious commit turns
+  `automations.yaml` into a symlink to `/etc/passwd` (info disclosure
+  on the subsequent cp) or to `/data/sync_status.json` (overwrite
+  with commit content). New config option `block_symlinks` (default
+  `true`) lets operators with intentional symlink use revert to the
+  v1.5.x behavior.
+
+  ERROR block lists the symlinks with their targets (truncated to 10
+  entries) and a copy-paste fix recipe.
+
+- **Feature (Review L11)**: New `.github/workflows/ci.yml` runs on
+  every push to main and on every PR:
+  - `shellcheck config-sync/run.sh` (excludes SC1091 + SC2012 which
+    are accepted info-level findings; everything else must pass)
+  - `docker build` smoke test for amd64 against the
+    `ghcr.io/home-assistant/amd64-base:3.21` base image used in
+    `build.yaml`
+
+  Closes the L11 review finding (zero CI / zero tests). Doesn't add
+  bats-style unit tests yet (those would be Sprint 6 if anyone asks).
+
+- **New options**:
+  - `allowed_repo_hosts: list[str]` (default `["github.com"]`)
+  - `block_symlinks: bool` (default `true`)
+
+- **All failure-path signals wired up for both new guards**: per-sync
+  structured log emits `event=tracked_symlinks result=abort` (host
+  failure is at startup, before any sync, so no per-sync log); HA
+  persistent_notification raised with a clear title; status sensor
+  updates to `failed` with `last_error: "[tracked_symlinks] ..."`;
+  git reset to LOCAL on abort so the next cycle retries the same SHA
+  once the operator has fixed the issue.
+
+- **No new permissions**. Both guards operate on local state
+  (config option + filesystem stat), no Supervisor or GitHub API
+  calls needed.
+
 ## 1.5.4
 
 Sprint 5 P0 from the 2026-05-25 code-and-security review. Fixes the
@@ -21,28 +89,18 @@ no behavior change in the happy path.
   no longer hangs the loop. Git aborts the operation if throughput stays
   below 1 KB/s for 60 seconds.
 - **Fix (Review M4)**: Replaced sed-based PAT URL substitution
-  (`echo "${REPO}" | sed "s|https://|https://${PAT}@|"`) with bash
-  parameter expansion (`${REPO/https:\/\//https:\/\/${PAT}@}`). The sed
-  form was fragile to `|`, `&`, or `/` in the PAT — it would silently
-  produce a broken URL because of delimiter collision or metachar
-  interpretation. Current GitHub PAT format doesn't use these chars
-  but the script will no longer silently fail if that ever changes.
-  Two locations: `CLONE_URL` (line ~1003) and `AUTH_URL` (line ~1011).
-  Same fix as shellcheck SC2001.
+  with bash parameter expansion (`${REPO/https:\/\//https:\/\/${PAT}@}`).
+  The sed form was fragile to `|`, `&`, or `/` in the PAT — silently
+  produces a broken URL on those characters. Two locations.
 - **Fix (Review M5)**: `sanitize_output()` now quotes the search side
-  of its pattern substitution: `${text//"${PAT}"/***}`. Without
-  quoting, glob characters in the PAT (`*`, `?`, `[`, `]`) would be
-  interpreted as bash patterns rather than literal characters, and the
-  PAT would silently fail to scrub from log output. The fix forces
-  literal-string matching.
+  of its pattern substitution: `${text//"${PAT}"/***}`. Forces
+  literal-string matching so glob chars (`*`, `?`, `[`, `]`) in a PAT
+  don't silently bypass the scrub.
 - **Fix (Review L13)**: `rel="${src#"${CONFIG_DIR}"/}"` — quote the
-  inner expansion in the parameter-substitution pattern. Same class as
-  M5, different location (the export-side staging loop). Resolves
+  inner expansion in the parameter-substitution pattern. Resolves
   shellcheck SC2295.
-- **Diagnostic improvement**: `log_supervisor_error()` now mentions the
-  timeout value in the "no response" branch ("Supervisor unreachable or
-  timed out after ${SUPERVISOR_API_TIMEOUT}s") so the operator can tell
-  the difference between network-broken and Supervisor-hung.
+- **Diagnostic improvement**: `log_supervisor_error()` distinguishes
+  "unreachable" from "timed out after Ns" in its no-response branch.
 - **No new config options**; no schema changes; no permission changes.
   Existing deployments get all five fixes automatically on update.
 
@@ -56,448 +114,157 @@ side log. Closes Sprint 4.
   changes to push writes a dedicated log file under
   `/data/logs/export/` named `<UTC-timestamp>-export-<mode>.log`
   (mode = `initial` or `auto`). Captures the export waypoints as
-  structured `event=` lines:
-  - `event=export_start mode=<m> branch=<b>` — first line, on open
-  - `event=files_staged count=N paths=a,b,c` — after diff --cached
-  - `event=commit sha=<short> files=N` — after git commit
-  - `event=push branch=<b> result=success` — on healthy push
-  - `event=push branch=<b> result=failed error="<truncated>"` — on push failure
-  - `event=push branch=<b> result=skipped reason=no_pat` — if PAT missing
-  - `event=export_end result=<success|push_failed|no_pat>` — last line
+  structured `event=` lines.
 - **New helpers**: `export_log_open(mode)`, `export_log(level, msg)`,
   `export_log_close(result)` mirror the `sync_log_*` shape. Share the
-  same `SYNC_LOG_MAX_FILES` (20) retention constant; pruning runs at
-  close time against the export subdir only.
-- **No-op cycles produce no log file**. `export_log_open()` is called
-  AFTER the `git diff --cached --quiet` check proves there are real
-  changes to push — matches the import-side discipline. The vast
-  majority of export cycles (no HA-side drift) leave the directory
-  unchanged.
+  same `SYNC_LOG_MAX_FILES` (20) retention constant.
 - **Separate subdir** (`/data/logs/export/`) keeps import and export
-  log streams from intermixing. Operators reading
-  `/data/logs/sync/` see only import cycles; `/data/logs/export/`
-  shows only push cycles. Both survive add-on restart + upgrade.
-- **PAT scrubbing on push failures**: the error text written to the
-  log goes through the existing `sanitize_output()` helper, which
-  strips any embedded PAT from credential URLs ("<pat>@github.com"
-  → "***@github.com"). Then truncated to 200 chars to keep the line
-  bounded.
-- **Best-effort throughout**: write failures degrade to no-op silently
-  via `>> file 2>/dev/null || true`; an export never blocks or fails
-  because of a log-write issue.
-- **No new config options**; no schema changes. No new permissions.
-  Operators who don't run with `export_enabled: true` see no
-  change in behavior.
-- **Sprint 4 complete with this release**. All four items shipped:
-  S4.P0 sync status sensor (v1.5.0), S4.P1 sync_paths gap guard
-  (v1.5.1), S4.P2 pre-sync backup retention (v1.5.2), S4.P3 export-
-  side structured log (v1.5.3).
+  log streams from intermixing.
+- **PAT scrubbing on push failures** via the existing `sanitize_output()`.
+- **Sprint 4 complete with this release**.
 
 ## 1.5.2
 
-Sprint 4 P2 from the hardening plan (see issue #9): bound the number
-of `gitops-pre-*` HA backups the add-on accumulates. Before v1.5.2,
-every sync left a pre-sync backup forever; on a busy sync day this
-could reach 10+ backups by evening with no automatic cleanup.
+Sprint 4 P2 from the hardening plan (issue #9): bound the number
+of `gitops-pre-*` HA backups the add-on accumulates.
 
-- **Feature (Sprint 4 P2)**: New `prune_pre_sync_backups()` helper
-  enumerates HA backups via `GET /backups`, filters to names starting
-  with `gitops-pre-`, sorts by `.date` descending, and deletes
-  everything past the Nth most recent via `DELETE /backups/<slug>`.
-  Called in every `do_import()` path that actually took a backup:
-  - Success path cleanup (after success + check_config_invalid
-    fall-through) — the common case.
-  - `check_config_api` failure (inline before `return 1`).
-  - `post_sync_verify` failure (inline before `return 1`).
+- **Feature**: `prune_pre_sync_backups()` enumerates HA backups via
+  `GET /backups`, filters to `gitops-pre-*` by name, sorts by date desc,
+  and deletes everything past the Nth most recent via `DELETE /backups/<slug>`.
 - **New option**: `pre_sync_backup_retention: int(0,50)` (default `7`).
-  `0` disables pruning entirely (v1.5.1 behavior — backups accumulate
-  forever). Default of 7 covers roughly a week of one-sync-per-day
-  deploys.
-- **Just-created backup never deleted in same cycle**: pruning runs
-  AFTER the new backup is taken, and the date-desc sort puts the
-  freshest one at index 0. With `retention >= 1`, the just-created
-  backup is always in the keep set — even on a failed sync where the
-  operator needs that exact backup for restore.
-- **Best-effort throughout**: a failed list (`GET /backups`) logs DEBUG
-  and returns; a failed delete logs WARN with HTTP code and continues
-  to the next slug. Status reporting / sync flow never blocked by
-  retention failures.
-- **Diagnostic signal**: each prune cycle that actually deletes
-  anything (or fails to) emits an INFO log line
-  `Pre-sync backup retention: pruned N, failed M (keeping last K)`
-  and a structured-log event `event=backup_prune retention=K deleted=N
-  failed=M`. Quiet on no-op cycles so the log isn't spammed.
-- **No new permissions**: `hassio_api: true` + `hassio_role: backup`
-  already cover list + delete on the backups endpoint. Comment in
-  `config.yaml` updated to document the new endpoint use.
-- **Implementation detail**: prefix matching is `startswith("gitops-pre-")`
-  on `.name`. Operator backups with that prefix would be caught too —
-  unlikely in practice, but worth knowing if you happen to name your
-  own backups that way.
+  `0` disables pruning entirely.
+- **Just-created backup never deleted in same cycle**.
+- **Best-effort throughout**: list/delete failures log WARN, never propagate.
+- **No new permissions**: `hassio_role: backup` already covers list+delete.
 
 ## 1.5.1
 
-Sprint 4 P1 from the hardening plan (see issue #9): enforce the
-sync_paths gap at sync time so a PR can't slip through between
-add-on restarts. Structurally prevents the 2026-05-25 incident class.
+Sprint 4 P1: enforce the sync_paths gap at sync time so a PR can't slip
+through between add-on restarts. Structurally prevents the 2026-05-25
+incident class.
 
-- **Feature (Sprint 4 P1)**: New `check_sync_paths_gap()` helper runs
-  early in `do_import()` (after `sync_log_open` + `status_mark_syncing`,
-  before pre-sync backup). Aborts the sync if the relevant
-  configuration.yaml has `!include_dir_*` directives targeting
-  directories not in `sync_paths` AND the current diff contains files
-  under those directories. Catches the exact failure mode from the
-  2026-05-25 incident: configuration.yaml had
-  `themes: !include_dir_merge_named themes/` but `themes/` was not in
-  `sync_paths`; PR added `themes/*.yaml` files; without this guard the
-  files were silently dropped and HA's frontend broke.
-- **Picks the right configuration.yaml**: If `configuration.yaml` is in
-  this sync's CHANGED list, the check audits the incoming repo version
-  (catches a PR that introduces a new gap directive). Otherwise it
-  audits the currently-active `/config` version (catches a PR that
-  adds files under an already-existing gap directive without modifying
-  configuration.yaml itself — the actual 2026-05-25 case).
-- **Diagnostic output on abort**: Emits a 12-line ERROR block
-  identifying (1) which gap directories trigger the abort, (2) which
-  files would be dropped (truncated to first 10 with overflow count),
-  and (3) a copy-paste-ready YAML snippet for the operator to add to
-  `sync_paths` in the add-on Configuration tab.
-- **All failure-path signals wired up**: `sync_log ERROR
-  event=sync_paths_gap result=abort` in the per-sync structured log;
-  `notify_sync_failure` raises the HA persistent_notification;
-  `status_mark_failure` sets `sensor.config_sync_status` to `failed`
-  with `last_error: "[sync_paths_gap] ..."`. After abort, git is
-  reset to LOCAL so the next cycle retries the same SHA once the
-  operator has fixed the gap.
+- **Feature**: `check_sync_paths_gap()` runs early in `do_import()`.
+  Aborts the sync if configuration.yaml has `!include_dir_*` directives
+  targeting directories not in `sync_paths` AND the current diff has
+  files under those directories.
 - **New option**: `strict_sync_paths_check: bool` (default `true`).
-  When `false`, the gap is logged loudly at ERROR but the sync
-  proceeds (matches v1.5.0 behavior). Default is `true` so existing
-  deployments get the protection automatically on update.
-- **Complements v1.1.7's `audit_include_dir_directives()`**, which
-  warns about sync_paths gaps at add-on STARTUP. The startup warning
-  is still useful for catching gaps the operator should fix before
-  the next sync; the new sync-time guard catches the case where a
-  PR introduces a new gap and lands without an add-on restart.
+- Complements v1.1.7's startup audit.
 
 ## 1.5.0
 
-Sprint 4 P0 from the hardening plan (see issue #9): expose sync state as
-a first-class HA sensor entity so operators, automations, and agents can
-subscribe to sync outcomes without scraping the rolling add-on log.
+Sprint 4 P0: expose sync state as a first-class HA sensor entity.
 
-- **Feature (Sprint 4 P0)**: After every sync cycle (success or failure),
-  the add-on publishes the outcome to TWO places:
-  - `sensor.config_sync_status` — first-class HA entity via
-    `POST /core/api/states/sensor.config_sync_status`. Appears in HA
-    natively (Developer Tools → States) and can be added to any dashboard
-    (recommended: tile card). Subscribable by automations — e.g. trigger
-    a Telegram notification when state goes to `failed`. Polled by
-    `agent-homeops` via the standard `/core/api/states/<entity>` endpoint.
-  - `/data/sync_status.json` — persistent JSON snapshot inside the add-on
-    container. Survives add-on restart + upgrade. Used to restore
-    lifetime counters on next boot, and for headless / non-HA-accessible
-    tooling that needs the same data via `docker exec`.
-- **State machine**: `idle` (boot, seeded once on add-on start) →
-  `syncing` (set at start of every do_import cycle that has changes) →
-  `success` | `failed` (set at the end of that cycle). The `syncing`
-  state gives dashboards a real-time view of work-in-progress; the
-  terminal states persist between cycles so the sensor always reflects
-  the most recent outcome.
-- **Attributes published with every state change**:
-  - `friendly_name`: "Config Sync Status"
-  - `icon`: `mdi:cloud-check` (success), `mdi:cloud-alert` (failed),
-    `mdi:cloud-sync` (idle / syncing). Operator sees obvious red/green
-    at-a-glance.
-  - `last_sync_at`: UTC ISO-8601 timestamp.
-  - `last_sha_short`: 8-char target commit SHA.
-  - `last_strategy`: `reload_all` | `reload_all_plus_themes` |
-    `core_restart` (matches the Sprint 3 reload-strategy keys).
-  - `last_error`: human-readable error text on failure, with a
-    `[stage]` prefix identifying where in the pipeline the failure
-    occurred (`pre_sync_backup`, `check_config_api`,
-    `check_config_invalid`, `post_sync_verify`).
-  - `last_backup_name`: name of the most recent pre-sync HA backup
-    (e.g. `gitops-pre-abc12345`), so the operator can copy-paste it
-    straight from the sensor attribute into Settings → System →
-    Backups for a one-click restore on catastrophic failure.
-  - `last_log_file`: path to the v1.4.1 per-sync structured log file
-    for the most recent run (e.g.
-    `/data/logs/sync/2026-05-25T19-30-00Z-abc12345.log`). Direct
-    pointer to the full event trace for the surfaced state.
-  - `sync_count`: lifetime counter; bumps on every cycle that did
-    real work (success OR failure), preserved across add-on restart
-    via the JSON snapshot.
-  - `failure_count`: lifetime counter; bumps only on failure.
-    Operators can compute the failure rate from these two numbers.
-- **New helpers**: `status_record()` is the single emitter; lifecycle
-  wrappers (`status_mark_idle`, `status_mark_syncing`,
-  `status_mark_success`, `status_mark_failure`) call it with the
-  right state and bump flags. `status_load_counters()` reads
-  persisted counters from the JSON snapshot at every cycle so the
-  count is durable across add-on restart.
-- **Resilience**: Both the disk write (`echo > .tmp && mv`) and the
-  sensor publish (`supervisor_api POST`) are best-effort. Failures
-  log a `WARN` (disk) or `DEBUG` (sensor — expected during HA
-  restart in the Sprint 3 strategy) and never propagate. Status
-  reporting must never block or break a sync.
-- **No new config options**; no schema changes. No new permissions —
-  `homeassistant_api: true` already grants
-  `POST /core/api/states/sensor.*`. Comment in `config.yaml` updated
-  to document the new endpoint use.
-- **Recommended dashboard card**:
-  ```yaml
-  type: tile
-  entity: sensor.config_sync_status
-  show_entity_picture: false
-  ```
+- **Feature**: `sensor.config_sync_status` published via
+  `POST /core/api/states/sensor.config_sync_status` after every cycle.
+  States: `idle` -> `syncing` -> `success` | `failed`.
+- **Attributes**: friendly_name, icon, last_sync_at, last_sha_short,
+  last_strategy, last_error (with [stage] prefix), last_backup_name,
+  last_log_file, sync_count, failure_count.
+- **Mirror snapshot** at `/data/sync_status.json` for headless tooling
+  and lifetime-counter persistence across restart.
+- **No new permissions**; no new config options; no schema changes.
 
 ## 1.4.1
 
-Sprint 3 P1 from the hardening plan (see issue #9): per-sync structured log
-file so operators can reconstruct exactly what happened during any past
-sync without scraping the rolling add-on log.
+Sprint 3 P1: per-sync structured log under `/data/logs/sync/`.
 
-- **Feature (Sprint 3 P1)**: Each sync cycle that has changes writes a
-  dedicated log file under `/data/logs/sync/` named
-  `<UTC-timestamp>-<remote-short-sha>.log`. Captures every major
-  waypoint with structured `event=` keys: `sync_start`, `files_changed`,
-  `backup`, `reconcile`, `check_config`, `reload`, `verify`, `sync_end`.
-  Lines are timestamped UTC ISO-8601 and prefixed with a level tag
-  (INFO / WARN / ERROR).
-- **New helpers**: `sync_log_open()` creates the file and writes the
-  `sync_start` line. `sync_log LEVEL msg` appends one line. `sync_log_close
-  RESULT` writes the `sync_end` line and rotates the directory down to the
-  most-recent 20 files. All three are no-ops if the log file path is unset,
-  so cycles with no changes produce no log noise.
-- **Storage**: `/data/` is the add-on's persistent storage (survives
-  restart + upgrade). Logs are container-internal — operator access is via
-  `docker exec -it addon_<slug>_config-sync ls -lt /data/logs/sync/`.
-  Hardcoded retention of 20 files (oldest auto-deleted) keeps the
-  footprint bounded; typical file size is ~2 KB so worst-case retained
-  log volume is ~40 KB.
-- **Resilience**: If `mkdir` on the log directory fails, the cycle logs a
-  WARNING and continues — per-sync logging is best-effort and never blocks
-  a sync. Per-line writes use `>> file 2>/dev/null || true` so a transient
-  IO error doesn't crash the loop.
-- **No new config options**; no schema changes. Operators who don't want
-  per-sync logs can simply ignore the directory (it's tiny).
+- Each sync cycle with changes writes `<UTC-timestamp>-<short-sha>.log`.
+- Captures `event=` keys for every major waypoint.
+- Hardcoded retention of 20 files.
+- Best-effort — logging failures never block a sync.
 
 ## 1.4.0
 
-Sprint 3 P0 from the hardening plan (see issue #9): pick the right
-reload strategy automatically so the 2026-05-25 incident class (lovelace
-dashboards needed manual restart after sync) never recurs.
+Sprint 3 P0: reload-strategy heuristic to prevent the 2026-05-25 incident.
 
-- **Feature (Sprint 3 P0)**: Three-way reload-strategy selection in
-  `do_import()` after check_config validates:
-  - `/core/restart` (heavy, ~30s downtime) when the diff touches the
-    lovelace key in `configuration.yaml`. `reload_all` does NOT
-    re-register `lovelace.dashboards` entries — this was the bug from
-    the 2026-05-25 incident.
-  - `reload_all` + `frontend.reload_themes` when any `themes/` file
-    changed but lovelace didn't. Reloads YAML domains and refreshes
-    the theme registry.
-  - `reload_all` (lightest, default) for everything else. Unchanged
-    behavior for the typical case.
-- **New helpers**: `sync_touches_lovelace()` uses `git diff LOCAL..REMOTE
-  -- configuration.yaml` to detect any `+/-` line matching `/lovelace/i`.
-  `sync_touches_themes()` checks if `^themes/` appears in `CHANGED`.
-  Both are cheap (one git diff, one grep) and emit no log noise on
-  the common case.
+- Three-way strategy in `do_import()`:
+  - `/core/restart` when configuration.yaml lovelace block changed
+  - `reload_all + frontend.reload_themes` when themes/ files changed
+  - `reload_all` otherwise (default)
 - **New option**: `restart_on_lovelace_change: bool` (default `true`).
-  Operators on latency-sensitive setups can disable to revert to
-  `reload_all` for lovelace changes (with the known caveat that
-  dashboards won't re-register until manual restart).
-- **Adaptive post-sync settle**: when the chosen strategy is restart,
-  the post-sync settle window grows by 25s (default total: 30s) so
-  HA has time to come back from the full restart before the health
-  probes run.
-- **Failure-notification message** updated to include the actual
-  strategy ("Applied /core/restart for…" vs "Applied reload_all for…")
-  so the operator immediately knows what was attempted.
-- No breaking changes; new option defaults to true so existing
-  deployments get the heuristic automatically on update.
+- Adaptive post-sync settle window: +25s for restart strategy.
 
 ## 1.3.1
 
-Sprint 2 P1 follow-up to v1.3.0 — surface sync failures in the HA UI so
-operators don't have to tail the add-on log to notice problems.
+Sprint 2 P1: persistent_notification in HA UI on sync failure.
 
-- **Feature**: Persistent notification in the HA UI when a sync fails.
-  Single notification (id: `config_sync_failure`) updates on each new
-  failure and auto-dismisses on the next successful sync. Operators see
-  exactly one notification reflecting the LATEST sync state.
-- **New option**: `notify_on_failure: bool` (default `true`). Set to
-  `false` for headless deployments where UI clutter is unwanted.
-- **Wired into all failure paths**:
-  - Pre-sync backup API failure → "Config Sync: pre-sync backup failed"
-  - `check_config` API unreachable → "Config Sync: check_config API unreachable"
-  - `check_config` returned invalid → "Config Sync: check_config rejected the new config"
-  - Post-sync verification failure → "Config Sync: post-sync verification failed" (includes the named backup to restore)
-- **New helpers**: `notify_sync_failure()` + `notify_sync_recovered()`
-  use `jq` to safely build the JSON body (handles quotes, newlines,
-  backslashes in error messages without breakage). Notification API
-  failures are logged WARN but don't cascade.
-- No schema-breaking change; `notify_on_failure` defaults to true so
-  existing deployments get the feature automatically on update.
+- Singleton notification (id `config_sync_failure`) updates on failure,
+  auto-dismisses on next healthy sync.
+- **New option**: `notify_on_failure: bool` (default `true`).
 
 ## 1.3.0
 
-Sprint 2 of the hardening plan (see issue #9): eliminate silent and
-opaque failures across `do_import()` and `do_export()`. Closes #2.
+Sprint 2: eliminate silent failures across do_import/do_export.
 
-- **Fix (closes #2)**: New `reconcile_tracked_files()` pass runs after the
-  diff-based file copy in every sync that has changes. Walks every
-  tracked file matching `sync_paths` and copies any that are missing
-  from `/config`. Catches the bug class where a tracked-but-never-
-  modified file fails to materialize because it wasn't in any diff —
-  configuration.yaml's `!include` against it then fails check_config,
-  rolling back the sync forever. Eliminates the workaround chain from
-  the M5.6 deploy ([JLay2026/home-assistant-config#2/#3/#4](https://github.com/JLay2026/home-assistant-config)).
-- **Fix (Sprint 2 P0)**: Race condition in `stage_config_to_repo()`
-  where `find | while read; do changed=1; done` ran the while loop
-  in a subshell, so `changed=1` never propagated. Function always
-  returned 0 regardless of what changed. Replaced pipe with process
-  substitution `< <(find ...)`. Also fixed a `find` argument-precedence
-  bug that matched any `*.yml` regardless of file type.
-- **Fix (Sprint 2 P1 audit)**: Both `reload_all` API calls in
-  `do_import()` previously used `> /dev/null 2>&1 || true`, silently
-  swallowing failures. Now they check the return value and call
-  `log_supervisor_error()` (with HTTP code + Supervisor response body)
-  on failure. Doesn't abort — post-sync probes catch real breakage
-  downstream — but operators now see WHEN and WHY reload_all failed.
-- **Fix (Sprint 2 P1 audit)**: Three `git checkout "${BRANCH}" --quiet
-  2>/dev/null || true` calls in `do_export()` extracted into a single
-  `checkout_back_to_sync_branch()` helper. Captures `git checkout`
-  stderr via `2>&1`, logs WARNING on failure with PAT scrubbed via
-  `sanitize_output()`. Failure leaves the next import cycle on the
-  wrong branch — now visible in the log instead of silently desyncing.
-- **Improvement**: Branch-switch logic in `do_export()` startup now
-  properly chains: try direct checkout → fall back to `-b` create →
-  log ERROR on both-failed (was silent fall-through to commit-on-wrong-branch).
-- **No new config options**; no schema changes; reverse-compat with v1.2.x.
+- **Fix (closes #2)**: `reconcile_tracked_files()` copies tracked-
+  but-missing files to /config on every sync with changes.
+- **Fix**: `find | while` subshell race in `stage_config_to_repo()`
+  replaced with process substitution. Function now correctly returns 1
+  when any file changed.
+- **Fix**: `reload_all` API failures captured + logged with HTTP code
+  + response body.
+- **Fix**: `git checkout` failures in `do_export()` captured + logged
+  with PAT-scrubbed stderr.
 
 ## 1.2.1
 
 - **Fix (P0)**: Grant `hassio_api: true` + `hassio_role: backup` so the
-  v1.2.0 pre-sync HA backup call to `POST /backups/new/partial` actually
-  succeeds. Without these permissions, the Supervisor rejected every
-  backup attempt and the add-on entered a rollback loop on every sync
-  cycle (production sync fully blocked). See issue #8 for the
-  incident timeline + Sprint 1 from issue #9.
-- **Fix (P0)**: `supervisor_api()` now captures HTTP status code + response
-  body via temp files (`/tmp/.sup_resp_body`, `/tmp/.sup_resp_code`).
-  Replaces `curl -sf` (silently discards body on non-2xx) with `curl -s
-  -o file -w "%{http_code}"`. Temp-file approach is subshell-safe —
-  the parent shell can read the diagnostic info even after
-  `var=$(supervisor_api ...)` runs the function in a subshell.
-- **New helper**: `log_supervisor_error()` prints HTTP code + truncated
-  (500 char) response body in a single log line. Used by every
-  diagnostic-needing failure path so operators see WHY a Supervisor
-  call failed, not just THAT it did.
-- **Applied diagnostic capture to**:
-  - `ha_backup_pre_sync()` error path — includes HTTP-code → likely-cause
-    cheat sheet (401/403 → permissions; 4xx → schema; 5xx → Supervisor)
-  - `post_sync_verify()` both probes (sun.sun + /core/api/)
-  - `do_import()` `check_config` API call
-- **Backwards compat**: `supervisor_api()` still echoes the body to stdout
-  (existing `$(supervisor_api ...)` callers work unchanged). Return code
-  semantics preserved: 0 on 2xx, non-zero on non-2xx; transport errors
-  now distinguishable via HTTP code "000".
+  v1.2.0 pre-sync HA backup actually succeeds.
+- **Fix (P0)**: `supervisor_api()` captures HTTP code + body via temp
+  files for diagnostic-quality error reporting (survives subshells).
+- **New helper**: `log_supervisor_error()`.
 
 ## 1.2.0
 
-- **Feature (safety)**: Before any `/config/` write, take a partial HA
-  backup via the Supervisor API named `gitops-pre-<short_sha>` covering
-  the `homeassistant` folder. If the backup API returns non-2xx, abort
-  the sync and roll the local git state back to the pre-merge SHA so
-  the next cycle retries. Storage-level safety net for the class of
-  failure where file-level rollback can't recover (e.g. .storage/
-  corruption). See issue #4.
-- **Feature (safety)**: After `reload_all`, sleep `post_sync_settle_seconds`
-  (new config option, default 5s) and then run two health probes against
-  the Supervisor Core API:
-  - `GET /core/api/states/sun.sun` — state machine alive
-  - `GET /core/api/` — auth + REST responsive
-  Either probe failing triggers file-level rollback, a best-effort
-  re-reload, and a prominent ERROR block pointing the operator at
-  the pre-sync HA backup for storage-level restore. Catches the
-  bug class where check_config passes but reload breaks HA (e.g.
-  the [JLay2026/nanoclaw-zimaos#50](https://github.com/JLay2026/nanoclaw-zimaos/issues/50)
-  2026-05-25 incident — frontend rendering failure with valid YAML).
-  See issue #5.
+- **Feature**: Pre-sync HA backup via `POST /backups/new/partial`
+  before any /config write.
+- **Feature**: Post-sync verification probes against /core/api/.
 - **New option**: `post_sync_settle_seconds: int(0,60)` (default 5).
-  Bump for slow HA setups; 0 disables the settle delay (probes run
-  immediately after reload_all returns).
-- **Helper extension**: `supervisor_api()` now accepts an optional third
-  argument (JSON body) so the backup API call can POST a request body.
-  Existing callers (check_config, reload_all, states) are unchanged.
 
 ## 1.1.7
 
-- **Feature**: At startup, scan `configuration.yaml` for `!include_dir_*`
-  directives targeting directories not in `sync_paths`, and emit a WARNING
-  for each gap. Catches the class of incident where a PR adds files under
-  a directory not in the allowlist — the add-on silently skips them, HA
-  references them, frontend assets break. See issue #3 (and the
-  [JLay2026/nanoclaw-zimaos#50](https://github.com/JLay2026/nanoclaw-zimaos/issues/50)
-  incident from 2026-05-25 for the motivating case).
-- New `audit_include_dir_directives()` helper using `grep` + `sed` +
-  the existing `path_allowed()` allowlist function. No new runtime
-  dependencies.
+- **Feature**: Startup audit for `!include_dir_*` directives pointing
+  outside sync_paths (emits WARNING per gap).
 
 ## 1.1.6
 
-- **Fix**: Log actual git push/fetch error messages instead of swallowing
-  stderr with `2>/dev/null` — PAT is sanitized from output
-- Added `sanitize_output()` helper to strip credentials from log messages
+- **Fix**: Log actual git push/fetch error messages instead of
+  swallowing stderr.
+- Added `sanitize_output()` helper to strip PAT from log output.
 
 ## 1.1.5
 
-- **Feature**: Add `scripts/` directory to default `sync_paths` so
-  script files split into a directory are synced alongside `scripts.yaml`
+- **Feature**: Add `scripts/` directory to default `sync_paths`.
 
 ## 1.1.4
 
-- **Fix**: Add `homeassistant_api: true` to config.yaml so the add-on
-  can call HA Core's `check_config` and `reload_all` endpoints
-  (fixes "check-config API unreachable" errors)
+- **Fix**: Add `homeassistant_api: true` to config.yaml.
 
 ## 1.1.3
 
-- **Fix**: Use `#!/usr/bin/with-contenv bash` shebang to get Supervisor
-  token and container environment (fixes "Unable to access the API,
-  forbidden" errors from bashio)
-- **Fix**: Set `$HOME` before `git config --global` to prevent
-  "fatal: $HOME not set" error
+- **Fix**: Use `#!/usr/bin/with-contenv bash` shebang.
+- **Fix**: Set `$HOME` before `git config --global`.
 
 ## 1.1.2
 
-- **Fix**: Replace `#!/usr/bin/with-bashio` shebang with `#!/usr/bin/env bash`
-  plus explicit `source /usr/lib/bashio/bashio.sh` to resolve
-  `/run.sh: not found` when the `with-bashio` wrapper is missing
+- **Fix**: Replace `#!/usr/bin/with-bashio` shebang.
 
 ## 1.1.1
 
-- **Fix**: Update base images from Alpine 3.20 to 3.21
-  (3.20 tags were removed from ghcr.io/home-assistant in Dec 2025)
+- **Fix**: Update base images from Alpine 3.20 to 3.21.
 
 ## 1.1.0
 
-- **Bidirectional sync**: export HA-side config changes back to GitHub
-- New options: `export_enabled`, `export_interval`, `export_branch`, `export_commit_message`
-- One-time export on startup (seeds repo or captures offline changes)
-- Auto-export loop detects /config drift and commits/pushes on schedule
-- Import-aware: skips export after import to prevent feedback loops
-- Refactored into `do_import()` and `do_export()` functions
-- Log messages now prefixed with Import/Export for clarity
+- **Bidirectional sync**: export HA-side config changes back to GitHub.
+- New options: `export_enabled`, `export_interval`, `export_branch`,
+  `export_commit_message`.
 
 ## 1.0.0
 
-- Initial release
-- GitOps sync from GitHub to HA `/config`
-- Supervisor API validation (check-config) before reload
-- Automatic rollback on invalid config
-- Configurable `sync_paths` allowlist
-- Private repo support via GitHub PAT
-- Multi-arch: amd64, aarch64, armv7, i386
+- Initial release.
+- GitOps sync from GitHub to HA /config.
+- Supervisor API validation (check-config) before reload.
+- Automatic rollback on invalid config.
+- Configurable `sync_paths` allowlist.
+- Private repo support via GitHub PAT.
+- Multi-arch: amd64, aarch64, armv7, i386.

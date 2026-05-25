@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  shellcheck:
+    name: shellcheck run.sh
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get install -y shellcheck
+      - name: Lint config-sync/run.sh
+        run: |
+          # SC1091 (bashio source not found) and SC2012 (ls vs find on
+          # operator-controlled filenames) are accepted info-level findings;
+          # everything else must pass.
+          shellcheck --exclude=SC1091,SC2012 config-sync/run.sh
+
+  docker-build:
+    name: docker build (amd64 smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Build amd64 image
+        # Mirrors the HA Add-on build flow: pass BUILD_FROM as the
+        # ghcr.io/home-assistant/amd64-base tag specified in build.yaml.
+        # Build only — don't push. Failure here means the Dockerfile
+        # or run.sh broke for amd64.
+        run: |
+          docker build \
+            --platform linux/amd64 \
+            --build-arg BUILD_FROM=ghcr.io/home-assistant/amd64-base:3.21 \
+            --tag ha-addon-config-sync:ci \
+            config-sync/

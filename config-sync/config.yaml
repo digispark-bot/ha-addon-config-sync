@@ -3,7 +3,7 @@ description: >-
   Bidirectional GitOps for Home Assistant — pulls config from GitHub,
   validates and reloads; exports HA-side changes back to GitHub.
   Zero SSH, fully GUI-managed.
-version: "1.5.4"
+version: "1.6.0"
 slug: "config-sync"
 url: "https://github.com/JLay2026/ha-addon-config-sync"
 startup: application
@@ -29,8 +29,6 @@ init: false
 #   hassio_role: backup    — least-privilege role granting the backups API.
 #                              `manager` would also work but is broader than
 #                              necessary. Covers list + delete as well as create.
-# See: GitHub issue #8 for the regression that prompted the hassio_api +
-# hassio_role grant in v1.2.1.
 homeassistant_api: true
 hassio_api: true
 hassio_role: backup
@@ -60,6 +58,14 @@ options:
   restart_on_lovelace_change: true
   strict_sync_paths_check: true
   pre_sync_backup_retention: 7
+  # v1.6.0 (Sprint 5 P1, M7): hostname allowlist for github_repo.
+  # Default catches the misconfigured-URL PAT-exfiltration case.
+  # Operators on GitHub Enterprise add their GHE hostname here.
+  allowed_repo_hosts:
+    - "github.com"
+  # v1.6.0 (Sprint 5 P1, M6): block syncs where any tracked file in
+  # sync_paths is a symlink (path-traversal vector via cp).
+  block_symlinks: true
 schema:
   github_repo: "url"
   branch: "str"
@@ -76,3 +82,6 @@ schema:
   restart_on_lovelace_change: "bool"
   strict_sync_paths_check: "bool"
   pre_sync_backup_retention: "int(0,50)"
+  allowed_repo_hosts:
+    - "str"
+  block_symlinks: "bool"
