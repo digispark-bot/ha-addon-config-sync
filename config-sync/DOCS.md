@@ -33,12 +33,13 @@ back to GitHub automatically.
     the most-recent `pre_sync_backup_retention` (default 7) and deletes the
     rest. The just-created backup is always in the keep set.
 
-Network operations to GitHub (`git fetch`, `git push`, `git clone`) are
-hard-bounded by `GIT_HTTP_LOW_SPEED_LIMIT=1000` + `GIT_HTTP_LOW_SPEED_TIMEOUT=60`
-as of v1.5.4 — they abort if throughput stays below 1 KB/s for 60 seconds.
-Supervisor API calls are similarly bounded by `--max-time 30 --connect-timeout 5`
-from v1.5.4. Without these, a stalled network or hung Supervisor would
-wedge the single-threaded sync loop indefinitely.
+Network operations to GitHub (`git fetch`, `git push`, `git clone`)
+are hard-bounded by `GIT_HTTP_LOW_SPEED_LIMIT=1000` +
+`GIT_HTTP_LOW_SPEED_TIMEOUT=60` as of v1.5.4 — they abort if
+throughput stays below 1 KB/s for 60 seconds. Supervisor API calls
+are similarly bounded by `--max-time 30 --connect-timeout 5`.
+Without these, a stalled network or hung Supervisor would wedge the
+single-threaded sync loop indefinitely.
 
 ### Export (HA → GitHub)
 
@@ -144,36 +145,43 @@ Public repo import works without a PAT.
 3. Check the `repo` scope (grants read/write to all your repos).
 4. Click **Generate token** and paste it into `github_pat`.
 
-Fine-grained is **strongly preferred** because it limits the blast radius
-if the token is ever exfiltrated — see the PAT-handling note in Security
-below.
+Fine-grained is **strongly preferred** because it limits the blast
+radius if the token is ever exfiltrated — see the PAT-handling note in
+"Where the PAT lives at runtime" below.
 
-### Where the PAT lives at runtime
+#### Where the PAT lives at runtime (v1.5.4 correction)
 
 The PAT you paste into the add-on UI is stored encrypted at rest by the
 Home Assistant Supervisor (HA's add-on options store).
 
-**However, at runtime, the add-on writes the PAT to `/data/repo/.git/config`
-on disk inside the add-on container**, as part of the HTTPS remote URL
+**However, at runtime, the add-on writes the PAT to
+`/data/repo/.git/config` on disk inside the add-on container**, as
+part of the HTTPS remote URL
 (`https://<PAT>@github.com/<owner>/<repo>.git`). This is how git
-authenticates fetch/push without a credential helper. The `/data/` path is
-on the persistent add-on volume — the PAT survives container restart.
+authenticates fetch/push without a credential helper. The `/data/`
+path is on the persistent add-on volume — the PAT survives container
+restart.
 
 Anyone with `docker exec` access to the add-on container (i.e. anyone
-with HAOS admin + host-level access) can read the PAT in plaintext from
-that file. The PAT is **also** scrubbed from log output by
+with HAOS admin + host-level access) can read the PAT in plaintext
+from that file. The PAT is **also** scrubbed from log output by
 `sanitize_output()` (v1.1.6+, hardened against glob-char fragility in
-v1.5.4) so it doesn't leak into the add-on log even on git error output.
+v1.5.4) so it doesn't leak into the add-on log even on git error
+output.
 
 **Recommendation**: use a fine-grained PAT scoped to the single GitHub
 repo you sync, with Contents: read+write only. That way if the PAT is
-ever exfiltrated, the attacker gets push access to one repo and nothing
-else — not your whole GitHub account. Rotate the PAT periodically by
-pasting a new one into the add-on options (the old one is overwritten in
-`.git/config` on the next add-on restart).
+ever exfiltrated, the attacker gets push access to one repo and
+nothing else — not your whole GitHub account. Rotate the PAT
+periodically by pasting a new one into the add-on options (the old
+one is overwritten in `.git/config` on the next add-on restart).
 
-A future release may add an optional git credential helper to keep the
-PAT out of `.git/config` entirely. Not yet implemented.
+A future release may add an optional git credential helper to keep
+the PAT out of `.git/config` entirely. Not yet implemented.
+
+(Prior to v1.5.4, this section incorrectly claimed the PAT was "never
+written to disk inside the container." That was a documentation bug,
+not a code change — the PAT has always been written to `.git/config`.)
 
 ## Workflows
 
@@ -255,22 +263,289 @@ name for manual backups you want to keep.
 - **No Samba.** Direct `/config` access via the Supervisor's `map: config:rw`.
 - **No inbound ports.** Only outbound HTTPS to GitHub and outbound HTTP
   to the Supervisor unix-socket-style endpoint.
+- **Network timeouts on every outbound call (v1.5.4+)**: Supervisor API
+  calls are bounded by `--max-time 30 --connect-timeout 5`; git network
+  operations are bounded by `GIT_HTTP_LOW_SPEED_LIMIT=1000` +
+  `GIT_HTTP_LOW_SPEED_TIMEOUT=60`. A hung remote can no longer wedge
+  the single-threaded sync loop indefinitely.
 - **Rollback on failure.** Invalid imports are automatically reverted. Storage-level
   rollback available via the `gitops-pre-<sha>` HA backup taken before each sync.
-- **GitHub PAT** is encrypted at rest by HA's options store, then written
-  to `.git/config` in plaintext inside the add-on container at runtime.
-  See the "Where the PAT lives at runtime" section above for the full
-  picture and the strong recommendation to use a fine-grained PAT scoped
-  to a single repo.
+- **GitHub PAT** is encrypted at rest by HA's options store, then
+  written to `.git/config` in plaintext inside the add-on container
+  at runtime. See "Where the PAT lives at runtime" under GitHub
+  Personal Access Token above for the full picture and the strong
+  recommendation to use a fine-grained PAT scoped to a single repo.
 - **PAT scrubbing in logs** via `sanitize_output()` (v1.1.6+, hardened
   in v1.5.4 against glob-char fragility).
-- **Network timeouts on every outbound call** (v1.5.4+): Supervisor API
-  calls bounded by `--max-time 30 --connect-timeout 5`, git network ops
-  bounded by `GIT_HTTP_LOW_SPEED_LIMIT=1000` + `GIT_HTTP_LOW_SPEED_TIMEOUT=60`.
-  A hung remote can no longer wedge the sync loop.
 - **Export commits** are attributed to `HA Config Sync <config-sync@homeassistant.local>`
   for clear audit trail in git history.
 
-(The Observability section, log examples, and Agent integration sections
-are unchanged from v1.5.3; see the file history if needed. Truncated
-here to keep the v1.5.4 diff focused on the changes.)
+## Observability
+
+The add-on surfaces sync state in five places, ordered from most operator-
+friendly to most diagnostic-detailed.
+
+### sensor.config_sync_status (v1.5.0+)
+
+First-class HA entity that reflects the most recent sync outcome. Visible in
+Developer Tools → States, addable to any dashboard, subscribable by
+automations, and queryable by external tooling (NanoClaw `agent-homeops`,
+Node-RED, etc) via the standard `/core/api/states/sensor.config_sync_status`
+endpoint.
+
+**States**: `idle` (boot, before any sync) → `syncing` (during do_import) →
+`success` | `failed`. Stays on the terminal state between cycles so the
+sensor always shows the latest outcome.
+
+**Attributes:**
+
+| Attribute | Description |
+|---|---|
+| `friendly_name` | Always `"Config Sync Status"` |
+| `icon` | `mdi:cloud-check` (success), `mdi:cloud-alert` (failed), `mdi:cloud-sync` (idle/syncing) |
+| `last_sync_at` | UTC ISO-8601 timestamp |
+| `last_sha_short` | 8-char target commit SHA |
+| `last_strategy` | `reload_all` / `reload_all_plus_themes` / `core_restart` (Sprint 3 reload key) |
+| `last_error` | Human-readable error text on failure, prefixed with `[stage]` (`pre_sync_backup`, `check_config_api`, `check_config_invalid`, `post_sync_verify`, `sync_paths_gap`) |
+| `last_backup_name` | Pre-sync HA backup name (e.g. `gitops-pre-abc12345`) for one-click restore |
+| `last_log_file` | Path to the per-sync structured log file for the run |
+| `sync_count` | Lifetime count of cycles that did real work |
+| `failure_count` | Lifetime count of failed cycles |
+
+**Recommended dashboard card:**
+
+```yaml
+type: tile
+entity: sensor.config_sync_status
+show_entity_picture: false
+```
+
+**Recommended automation — ping on failure:**
+
+```yaml
+alias: Notify on Config Sync failure
+trigger:
+  - platform: state
+    entity_id: sensor.config_sync_status
+    to: failed
+action:
+  - service: notify.telegram
+    data:
+      message: |
+        Config Sync failed at {{ state_attr('sensor.config_sync_status', 'last_sync_at') }}
+        SHA: {{ state_attr('sensor.config_sync_status', 'last_sha_short') }}
+        Error: {{ state_attr('sensor.config_sync_status', 'last_error') }}
+        Restore backup: {{ state_attr('sensor.config_sync_status', 'last_backup_name') }}
+```
+
+### /data/sync_status.json (v1.5.0+)
+
+Mirror of the sensor's state + attributes, written to the add-on's persistent
+storage. Survives add-on restart and upgrade. Used internally to restore
+lifetime counters across reboots, and externally by headless tooling that
+doesn't have HA API access.
+
+Operator access:
+
+```
+docker exec -it addon_<slug>_config-sync cat /data/sync_status.json | jq
+```
+
+### Rolling add-on log
+
+Check the **Log** tab in the add-on panel for the live log stream.
+
+### Per-sync structured log (v1.4.1+)
+
+In addition to the rolling add-on log, every sync cycle that has changes
+writes a dedicated structured log file under `/data/logs/sync/` inside the
+add-on container. Filename is `<UTC-timestamp>-<remote-short-sha>.log`.
+Retention is hardcoded to the most-recent 20 files (oldest auto-deleted).
+
+Each file captures every major waypoint with `event=` keys:
+
+```
+2026-05-26T03:14:07Z [INFO] event=sync_start local=abc12345 remote=def67890
+2026-05-26T03:14:07Z [INFO] event=files_changed count=2 paths=automations.yaml,scripts.yaml
+2026-05-26T03:14:09Z [INFO] event=backup result=triggered name=gitops-pre-def67890
+2026-05-26T03:14:10Z [INFO] event=reconcile copied=0 failed=0
+2026-05-26T03:14:11Z [INFO] event=check_config result=valid
+2026-05-26T03:14:11Z [INFO] event=reload strategy=reload_all reason=default
+2026-05-26T03:14:17Z [INFO] event=verify probe=sun.sun result=pass
+2026-05-26T03:14:17Z [INFO] event=verify probe=core_api result=pass
+2026-05-26T03:14:18Z [INFO] event=backup_prune retention=7 deleted=1 failed=0
+2026-05-26T03:14:18Z [INFO] event=sync_end result=success
+```
+
+Operator access:
+
+```
+docker exec -it addon_<slug>_config-sync ls -lt /data/logs/sync/
+docker exec -it addon_<slug>_config-sync cat /data/logs/sync/<filename>.log
+```
+
+Use this when investigating a past sync that the rolling log has scrolled
+past, or when reconstructing the exact sequence around a known-bad commit.
+The `/data/` mount is persistent across add-on restarts and upgrades, so
+the log history survives a container rebuild. The path of the latest
+file is also exposed as the `last_log_file` attribute on
+`sensor.config_sync_status` for direct lookup.
+
+If `mkdir` on the log directory fails (e.g. disk full), the cycle logs a
+WARNING to the rolling add-on log and continues — per-sync logging is
+best-effort and never blocks a sync.
+
+### Per-export structured log (v1.5.3+)
+
+Export-side parity with the per-sync log. Every `do_export()` cycle that
+has real changes to push writes a dedicated file under `/data/logs/export/`
+named `<UTC-timestamp>-export-<mode>.log` where `<mode>` is `initial` or
+`auto`. No-op export cycles (no HA-side drift) produce no log file. Same
+20-file retention as the sync side; separate subdir so the two streams
+don't intermix.
+
+Event vocabulary (one per line):
+
+```
+2026-05-26T03:30:00Z [INFO] event=export_start mode=auto branch=main
+2026-05-26T03:30:01Z [INFO] event=files_staged count=2 paths=automations.yaml,scripts.yaml
+2026-05-26T03:30:01Z [INFO] event=commit sha=abc12345 files=2
+2026-05-26T03:30:03Z [INFO] event=push branch=main result=success
+2026-05-26T03:30:03Z [INFO] event=export_end result=success
+```
+
+Failure-path examples:
+
+```
+2026-05-26T03:35:00Z [INFO] event=export_start mode=auto branch=main
+2026-05-26T03:35:01Z [INFO] event=files_staged count=1 paths=automations.yaml
+2026-05-26T03:35:01Z [INFO] event=commit sha=def67890 files=1
+2026-05-26T03:35:02Z [ERROR] event=push branch=main result=failed error="remote: Permission denied to ..."
+2026-05-26T03:35:02Z [INFO] event=export_end result=push_failed
+```
+
+```
+2026-05-26T03:40:00Z [INFO] event=export_start mode=initial branch=main
+2026-05-26T03:40:01Z [INFO] event=files_staged count=3 paths=automations.yaml,scripts.yaml,scenes.yaml
+2026-05-26T03:40:01Z [INFO] event=commit sha=xyz98765 files=3
+2026-05-26T03:40:01Z [WARN] event=push branch=main result=skipped reason=no_pat
+2026-05-26T03:40:01Z [INFO] event=export_end result=no_pat
+```
+
+Operator access:
+
+```
+docker exec -it addon_<slug>_config-sync ls -lt /data/logs/export/
+docker exec -it addon_<slug>_config-sync cat /data/logs/export/<filename>.log
+```
+
+Push error text is run through `sanitize_output()` first — any embedded
+GitHub PAT is scrubbed before being written to the log. The error string
+is also truncated to 200 characters to keep each line bounded.
+
+### Import logs (happy path)
+
+```
+[config-sync] Import: change detected (abc12345 -> def67890)
+[config-sync] Import: syncing configuration.yaml automations.yaml
+[config-sync] Pre-sync HA backup 'gitops-pre-def67890' triggered — Settings → System → Backups
+[config-sync] Import: config valid — reloading Home Assistant
+[config-sync] Import: reload complete (abc12345 -> def67890)
+[config-sync] Post-sync verify: both probes passed — sync verified healthy
+[config-sync] Pre-sync backup retention: pruned 1, failed 0 (keeping last 7)
+```
+
+### Export logs
+
+```
+[config-sync] Export enabled — running initial export
+[config-sync] Export (initial): committed automations.yaml scripts.yaml
+[config-sync] Export (initial): pushed to origin/main
+[config-sync] Export (auto): committed automations.yaml
+[config-sync] Export (auto): pushed to origin/main
+```
+
+### Error logs
+
+Failed Supervisor API calls log the actual HTTP status code and a
+truncated response body so the root cause is visible without a separate
+diagnostic step. Examples:
+
+```
+[config-sync] Pre-sync HA backup API failed — REFUSING to sync (HTTP 403)
+[config-sync]   Supervisor response: {"result":"error","message":"You don't have the role to call this endpoint"}
+[config-sync]   Common causes for this endpoint:
+[config-sync]     HTTP 401/403 — add-on missing 'hassio_api: true' or 'hassio_role: backup' in config.yaml
+[config-sync]     HTTP 4xx     — backup integration not loaded, or request body schema changed
+[config-sync]     HTTP 5xx     — Supervisor internal error, or disk full
+[config-sync] Aborting sync — rolling back git state to abc12345; next cycle will retry
+```
+
+A v1.5.1 sync_paths gap abort looks like:
+
+```
+[config-sync] ============================================================
+[config-sync] SYNC ABORTED — sync_paths gap detected
+[config-sync] ============================================================
+[config-sync] configuration.yaml (/data/repo/configuration.yaml) has !include_dir_* directives
+[config-sync] targeting directories NOT in sync_paths:
+[config-sync]   themes/ 
+[config-sync] 
+[config-sync] This sync would update configuration.yaml's references but
+[config-sync] the sync_paths filter blocks 3 referenced file(s) from reaching /config.
+[config-sync] HA will see configuration.yaml pointing at files that don't exist on disk —
+[config-sync] frontend assets, themes, or lovelace dashboards may break.
+[config-sync] 
+[config-sync] Affected files (first 10):
+[config-sync]   - themes/dark.yaml
+[config-sync]   - themes/light.yaml
+[config-sync]   - themes/seasonal.yaml
+[config-sync] 
+[config-sync] Fix: open the add-on Configuration tab, add these to sync_paths:
+[config-sync]     - "themes/"
+[config-sync] Save the config and restart the add-on. The next sync will retry.
+[config-sync] ============================================================
+```
+
+Other failure examples:
+
+```
+[config-sync] Import: config invalid: Integration 'nonexistent' not found
+[config-sync] Import: rolling back to abc12345
+```
+
+```
+[config-sync] Post-sync probe 2 FAILED: /core/api/ unresponsive or auth rejected (HTTP 500)
+[config-sync]   Supervisor response: {"error":"Internal Server Error"}
+[config-sync] POST-SYNC VERIFICATION FAILED — rolling back
+[config-sync] If HA is still broken, restore the pre-sync backup:
+[config-sync]   Settings → System → Backups → 'gitops-pre-def67890'
+```
+
+```
+[config-sync] Export: no github_pat configured — cannot push (read-only)
+```
+
+If a sync fails with a Supervisor response you don't understand, the
+HTTP code + response body in the log line are enough to file an issue
+with full diagnostic context.
+
+## Agent integration
+
+The add-on can be managed and observed programmatically. Any agent or
+automation platform that can call the HA REST API can:
+
+- **Subscribe to sync state** (v1.5.0+): `GET /core/api/states/sensor.config_sync_status` returns the current state + attributes; use the standard HA state-change WebSocket for push.
+- **Read add-on options**: `GET/POST /addons/config-sync/options`
+- **Start/stop/restart**: `POST /addons/config-sync/{start,stop,restart}`
+- **Read add-on logs**: `GET /addons/config-sync/logs`
+- **Check add-on status**: `GET /addons/config-sync/info`
+
+To trigger an on-demand export, an agent can restart the add-on — the
+initial export runs on every startup when `export_enabled` is true.
+
+This makes it compatible with NanoClaw's `agent-homeops`, Home Assistant
+automations, or any future agent platform. NanoClaw `agent-homeops` is
+the intended primary consumer of `sensor.config_sync_status` — it polls
+the state and surfaces failures via the Telegram channel without needing
+`docker exec` into the add-on container.
