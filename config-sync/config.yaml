@@ -3,7 +3,7 @@ description: >-
   Bidirectional GitOps for Home Assistant — pulls config from GitHub,
   validates and reloads; exports HA-side changes back to GitHub.
   Zero SSH, fully GUI-managed.
-version: "1.3.0"
+version: "1.3.1"
 slug: "config-sync"
 url: "https://github.com/JLay2026/ha-addon-config-sync"
 startup: application
@@ -16,7 +16,8 @@ arch:
 init: false
 # Permissions:
 #   homeassistant_api: true — Core API access (check_config, reload_all,
-#                              /core/api/* probes)
+#                              /core/api/* probes, persistent_notification
+#                              create/dismiss for sync-failure notifications)
 #   hassio_api: true       — Supervisor API access (POST /backups/new/partial
 #                              for the pre-sync HA backup feature; v1.2.0+)
 #   hassio_role: backup    — least-privilege role granting the backups API.
@@ -49,6 +50,7 @@ options:
   export_branch: ""
   export_commit_message: "export: HA config snapshot"
   post_sync_settle_seconds: 5
+  notify_on_failure: true
 schema:
   github_repo: "url"
   branch: "str"
@@ -61,3 +63,4 @@ schema:
   export_branch: "str?"
   export_commit_message: "str?"
   post_sync_settle_seconds: "int(0,60)"
+  notify_on_failure: "bool"
