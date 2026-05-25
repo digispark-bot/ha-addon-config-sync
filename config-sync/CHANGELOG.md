@@ -1,5 +1,52 @@
 # Changelog
 
+## 1.5.3
+
+Sprint 4 P3 from the hardening plan (see issue #9) — the final item.
+Export-side per-cycle structured log parity with the v1.4.1 import-
+side log. Closes Sprint 4.
+
+- **Feature (Sprint 4 P3)**: Each `do_export()` cycle that has real
+  changes to push writes a dedicated log file under
+  `/data/logs/export/` named `<UTC-timestamp>-export-<mode>.log`
+  (mode = `initial` or `auto`). Captures the export waypoints as
+  structured `event=` lines:
+  - `event=export_start mode=<m> branch=<b>` — first line, on open
+  - `event=files_staged count=N paths=a,b,c` — after diff --cached
+  - `event=commit sha=<short> files=N` — after git commit
+  - `event=push branch=<b> result=success` — on healthy push
+  - `event=push branch=<b> result=failed error="<truncated>"` — on push failure
+  - `event=push branch=<b> result=skipped reason=no_pat` — if PAT missing
+  - `event=export_end result=<success|push_failed|no_pat>` — last line
+- **New helpers**: `export_log_open(mode)`, `export_log(level, msg)`,
+  `export_log_close(result)` mirror the `sync_log_*` shape. Share the
+  same `SYNC_LOG_MAX_FILES` (20) retention constant; pruning runs at
+  close time against the export subdir only.
+- **No-op cycles produce no log file**. `export_log_open()` is called
+  AFTER the `git diff --cached --quiet` check proves there are real
+  changes to push — matches the import-side discipline. The vast
+  majority of export cycles (no HA-side drift) leave the directory
+  unchanged.
+- **Separate subdir** (`/data/logs/export/`) keeps import and export
+  log streams from intermixing. Operators reading
+  `/data/logs/sync/` see only import cycles; `/data/logs/export/`
+  shows only push cycles. Both survive add-on restart + upgrade.
+- **PAT scrubbing on push failures**: the error text written to the
+  log goes through the existing `sanitize_output()` helper, which
+  strips any embedded PAT from credential URLs ("<pat>@github.com"
+  → "***@github.com"). Then truncated to 200 chars to keep the line
+  bounded.
+- **Best-effort throughout**: write failures degrade to no-op silently
+  via `>> file 2>/dev/null || true`; an export never blocks or fails
+  because of a log-write issue.
+- **No new config options**; no schema changes. No new permissions.
+  Operators who don't run with `export_enabled: true` see no
+  change in behavior.
+- **Sprint 4 complete with this release**. All four items shipped:
+  S4.P0 sync status sensor (v1.5.0), S4.P1 sync_paths gap guard
+  (v1.5.1), S4.P2 pre-sync backup retention (v1.5.2), S4.P3 export-
+  side structured log (v1.5.3).
+
 ## 1.5.2
 
 Sprint 4 P2 from the hardening plan (see issue #9): bound the number

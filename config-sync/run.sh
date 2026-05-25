@@ -3,7 +3,7 @@
 # Source the bashio library (HA add-on option parsing + logging)
 source /usr/lib/bashio/bashio.sh
 # ---------------------------------------------------------------
-# Config Sync (GitOps) — HA Supervisor Add-on  v1.5.2
+# Config Sync (GitOps) — HA Supervisor Add-on  v1.5.3
 #
 # Bidirectional sync:
 #   IMPORT — pull config from GitHub → backup HA → validate → reload → verify
@@ -113,6 +113,16 @@ SYNC_LOG_MAX_FILES=20
 # helpers (e.g. post_sync_verify) without needing to plumb the file
 # path through arguments.
 SYNC_LOG_FILE=""
+
+# Per-export structured-log location (v1.5.3, Sprint 4 P3 — export-side
+# parity with the v1.4.1 import-side log). Same parent /data/ tier;
+# same retention (SYNC_LOG_MAX_FILES = 20); separate subdir so import
+# and export logs don't intermix. Filename pattern:
+# <UTC-timestamp>-export-<mode>.log where <mode> is "initial" or "auto".
+EXPORT_LOG_DIR="/data/logs/export"
+# Set per-cycle by export_log_open(); cleared by export_log_close().
+# When empty, export_log() is a no-op. Parallel to SYNC_LOG_FILE.
+EXPORT_LOG_FILE=""
 
 # Sync status JSON + HA sensor entity (v1.5.0).
 # After every cycle, sync state is published to:
@@ -236,6 +246,69 @@ sync_log_close() {
             | tail -n +$((SYNC_LOG_MAX_FILES + 1)) \
             | while IFS= read -r old; do
                 rm -f "${SYNC_LOG_DIR}/${old}" 2>/dev/null || true
+            done
+    fi
+}
+
+# ────────────────────────────────────────────────────────────────────
+#  Per-export structured log (v1.5.3, Sprint 4 P3)
+# ────────────────────────────────────────────────────────────────────
+# Mirror of the v1.4.1 import-side log, applied to do_export(). Each
+# export cycle that has actual changes to push writes a dedicated file
+# under /data/logs/export/ capturing the export waypoints as structured
+# event=key=value lines. Cycles where nothing changed (the common case)
+# produce no log file — matches the import-side discipline of staying
+# quiet on no-ops.
+#
+# Format (one event per line): same as the import-side log.
+# Retention: hardcoded SYNC_LOG_MAX_FILES (20), shared constant.
+# Pruning runs at close time on a separate mtime sort over /data/logs/export.
+# ────────────────────────────────────────────────────────────────────
+
+# Open a new per-export log file. Called from do_export() AFTER the
+# git diff --cached --quiet check proves there are real changes to push
+# (no log noise on no-op cycles).
+#   $1 = mode  ("initial" or "auto")
+export_log_open() {
+    local mode="$1"
+    local fname_ts
+    fname_ts=$(date -u '+%Y-%m-%dT%H-%M-%SZ')
+    if ! mkdir -p "${EXPORT_LOG_DIR}" 2>/dev/null; then
+        bashio::log.warning "export_log: failed to create ${EXPORT_LOG_DIR} — per-export log disabled this cycle"
+        EXPORT_LOG_FILE=""
+        return 0
+    fi
+    EXPORT_LOG_FILE="${EXPORT_LOG_DIR}/${fname_ts}-export-${mode}.log"
+    export_log INFO "event=export_start mode=${mode} branch=${EXPORT_BRANCH}"
+}
+
+# Append a structured event line to the current per-export log file.
+# No-op if no log is open. Parallel to sync_log().
+#   $1 = level (INFO / WARN / ERROR)
+#   $2+ = key=value tokens
+export_log() {
+    [ -z "${EXPORT_LOG_FILE}" ] && return 0
+    local level="$1"
+    shift
+    local ts
+    ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+    echo "${ts} [${level}] $*" >> "${EXPORT_LOG_FILE}" 2>/dev/null || true
+}
+
+# Close the current per-export log with a summary line and prune old
+# files. Idempotent. Parallel to sync_log_close().
+#   $1 = result (success / push_failed / no_pat / unknown)
+export_log_close() {
+    [ -z "${EXPORT_LOG_FILE}" ] && return 0
+    local result="${1:-unknown}"
+    export_log INFO "event=export_end result=${result}"
+    EXPORT_LOG_FILE=""
+    if [ -d "${EXPORT_LOG_DIR}" ]; then
+        # shellcheck disable=SC2012  # ls -t is the right tool here
+        ls -1t "${EXPORT_LOG_DIR}" 2>/dev/null \
+            | tail -n +$((SYNC_LOG_MAX_FILES + 1)) \
+            | while IFS= read -r old; do
+                rm -f "${EXPORT_LOG_DIR}/${old}" 2>/dev/null || true
             done
     fi
 }
@@ -1088,18 +1161,31 @@ do_export() {
         return 0
     fi
 
+    # Real changes to push — open per-export structured log (v1.5.3).
+    # No log file for no-op cycles, matching the import-side discipline.
+    export_log_open "${label}"
+
     # Commit with timestamp
     local ts
     ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
-    local files_changed
+    local files_changed files_count files_csv
     files_changed=$(git diff --cached --name-only | tr '\n' ' ')
+    files_count=$(git diff --cached --name-only | wc -l | tr -d ' ')
+    files_csv=$(git diff --cached --name-only | tr '\n' ',' | sed 's/,$//')
+    export_log INFO "event=files_staged count=${files_count} paths=${files_csv}"
+
     git commit -m "${EXPORT_MSG} (${ts})" -m "Files: ${files_changed}" --quiet
+    local commit_sha
+    commit_sha=$(git rev-parse HEAD)
+    export_log INFO "event=commit sha=${commit_sha:0:8} files=${files_count}"
 
     bashio::log.info "Export (${label}): committed ${files_changed}"
 
     # Push
     if [ -z "${PAT}" ]; then
         bashio::log.warning "Export: no github_pat configured — cannot push (read-only)"
+        export_log WARN "event=push branch=${EXPORT_BRANCH} result=skipped reason=no_pat"
+        export_log_close no_pat
         checkout_back_to_sync_branch || true
         return 1
     fi
@@ -1108,8 +1194,16 @@ do_export() {
     if push_output=$(git push origin "${EXPORT_BRANCH}" 2>&1); then
         bashio::log.info "Export (${label}): pushed to origin/${EXPORT_BRANCH}"
         date -u '+%s' > "${LAST_EXPORT_TS}"
+        export_log INFO "event=push branch=${EXPORT_BRANCH} result=success"
+        export_log_close success
     else
         bashio::log.error "Export (${label}): push failed — $(sanitize_output "${push_output}")"
+        # Truncate push error to keep the log line bounded; sanitize_output
+        # strips the PAT from credential URLs.
+        local push_err_short
+        push_err_short=$(sanitize_output "${push_output}" | tr '\n' ' ' | head -c 200)
+        export_log ERROR "event=push branch=${EXPORT_BRANCH} result=failed error=\"${push_err_short}\""
+        export_log_close push_failed
     fi
 
     checkout_back_to_sync_branch || true
