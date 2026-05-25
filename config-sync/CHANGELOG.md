@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.2.1
+
+- **Fix (P0)**: Grant `hassio_api: true` + `hassio_role: backup` so the
+  v1.2.0 pre-sync HA backup call to `POST /backups/new/partial` actually
+  succeeds. Without these permissions, the Supervisor rejected every
+  backup attempt and the add-on entered a rollback loop on every sync
+  cycle (production sync fully blocked). See issue #8 for the
+  incident timeline + Sprint 1 from issue #9.
+- **Fix (P0)**: `supervisor_api()` now captures HTTP status code + response
+  body via temp files (`/tmp/.sup_resp_body`, `/tmp/.sup_resp_code`).
+  Replaces `curl -sf` (silently discards body on non-2xx) with `curl -s
+  -o file -w "%{http_code}"`. Temp-file approach is subshell-safe —
+  the parent shell can read the diagnostic info even after
+  `var=$(supervisor_api ...)` runs the function in a subshell.
+- **New helper**: `log_supervisor_error()` prints HTTP code + truncated
+  (500 char) response body in a single log line. Used by every
+  diagnostic-needing failure path so operators see WHY a Supervisor
+  call failed, not just THAT it did.
+- **Applied diagnostic capture to**:
+  - `ha_backup_pre_sync()` error path — includes HTTP-code → likely-cause
+    cheat sheet (401/403 → permissions; 4xx → schema; 5xx → Supervisor)
+  - `post_sync_verify()` both probes (sun.sun + /core/api/)
+  - `do_import()` `check_config` API call
+- **Backwards compat**: `supervisor_api()` still echoes the body to stdout
+  (existing `$(supervisor_api ...)` callers work unchanged). Return code
+  semantics preserved: 0 on 2xx, non-zero on non-2xx; transport errors
+  now distinguishable via HTTP code "000".
+
 ## 1.2.0
 
 - **Feature (safety)**: Before any `/config/` write, take a partial HA

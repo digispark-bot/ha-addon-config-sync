@@ -3,7 +3,7 @@ description: >-
   Bidirectional GitOps for Home Assistant — pulls config from GitHub,
   validates and reloads; exports HA-side changes back to GitHub.
   Zero SSH, fully GUI-managed.
-version: "1.2.0"
+version: "1.2.1"
 slug: "config-sync"
 url: "https://github.com/JLay2026/ha-addon-config-sync"
 startup: application
@@ -14,7 +14,19 @@ arch:
   - armv7
   - i386
 init: false
+# Permissions:
+#   homeassistant_api: true — Core API access (check_config, reload_all,
+#                              /core/api/* probes)
+#   hassio_api: true       — Supervisor API access (POST /backups/new/partial
+#                              for the pre-sync HA backup feature; v1.2.0+)
+#   hassio_role: backup    — least-privilege role granting the backups API.
+#                              `manager` would also work but is broader than
+#                              necessary.
+# See: GitHub issue #8 for the regression that prompted the hassio_api +
+# hassio_role grant in v1.2.1.
 homeassistant_api: true
+hassio_api: true
+hassio_role: backup
 map:
   - config:rw
 options:

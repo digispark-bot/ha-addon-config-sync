@@ -3,7 +3,7 @@
 # Source the bashio library (HA add-on option parsing + logging)
 source /usr/lib/bashio/bashio.sh
 # ---------------------------------------------------------------
-# Config Sync (GitOps) — HA Supervisor Add-on  v1.2.0
+# Config Sync (GitOps) — HA Supervisor Add-on  v1.2.1
 #
 # Bidirectional sync:
 #   IMPORT — pull config from GitHub → backup HA → validate → reload → verify
@@ -42,6 +42,13 @@ CONFIG_DIR="/config"
 ROLLBACK_DIR="/data/.rollback"
 LAST_IMPORT_MARKER="/data/.last-import"
 LAST_EXPORT_TS="/data/.last-export-ts"
+
+# Diagnostic-capture temp files for supervisor_api().
+# These survive the subshell boundary used by `var=$(supervisor_api ...)`,
+# so the parent shell can read them after the call returns. The add-on
+# runs as a single-threaded bash loop so there's no concurrent-write risk.
+SUPERVISOR_RESP_BODY_FILE="/tmp/.sup_resp_body"
+SUPERVISOR_RESP_CODE_FILE="/tmp/.sup_resp_code"
 
 # Default export branch to the sync branch if not set
 if [ -z "${EXPORT_BRANCH}" ]; then
@@ -84,22 +91,82 @@ path_allowed() {
     return 1
 }
 
-# Call the Supervisor API.
+# Call the Supervisor API and capture both the response body AND the
+# HTTP status code for diagnostic-quality error reporting.
+#
 #   $1 = method (GET, POST, etc)
 #   $2 = endpoint (e.g. "/core/api/states/sun.sun")
 #   $3 = optional JSON body (string)
-# Returns curl's exit code (0 on 2xx, non-zero on transport/HTTP error).
-# Writes the response body to stdout.
+#
+# Behavior:
+#   - Writes the response body to stdout (so existing $(supervisor_api ...)
+#     callers continue to work)
+#   - Also writes the response body to ${SUPERVISOR_RESP_BODY_FILE} and
+#     the HTTP status code to ${SUPERVISOR_RESP_CODE_FILE}. These survive
+#     the subshell used by command substitution — the parent shell can
+#     read them after the call returns.
+#   - Returns 0 on HTTP 2xx, 1 on non-2xx HTTP response (e.g. 401/403/404/500),
+#     2 on transport error (curl couldn't connect).
+#
+# Callers that want a diagnostic log line on failure should call
+# log_supervisor_error after a non-zero return.
 supervisor_api() {
     local method="$1" endpoint="$2" body="${3:-}"
-    local -a args=(-sf -X "${method}"
+    local -a args=(-s -o "${SUPERVISOR_RESP_BODY_FILE}" -X "${method}"
                    "http://supervisor${endpoint}"
                    -H "Authorization: Bearer ${SUPERVISOR_TOKEN}"
-                   -H "Content-Type: application/json")
+                   -H "Content-Type: application/json"
+                   -w "%{http_code}")
     if [ -n "${body}" ]; then
         args+=(-d "${body}")
     fi
-    curl "${args[@]}" 2>/dev/null
+
+    # Ensure files exist + are empty even on transport error — readers
+    # never see stale content from a prior call.
+    : > "${SUPERVISOR_RESP_BODY_FILE}"
+    : > "${SUPERVISOR_RESP_CODE_FILE}"
+
+    local code
+    if ! code=$(curl "${args[@]}" 2>/dev/null); then
+        # Transport failure — couldn't reach Supervisor at all.
+        echo "000" > "${SUPERVISOR_RESP_CODE_FILE}"
+        return 2
+    fi
+    echo "${code}" > "${SUPERVISOR_RESP_CODE_FILE}"
+
+    # Body echo for backwards compat with `var=$(supervisor_api ...)`.
+    cat "${SUPERVISOR_RESP_BODY_FILE}"
+
+    if [ "${code:0:1}" = "2" ]; then
+        return 0
+    fi
+    return 1
+}
+
+# Emit a structured ERROR log line for a failed supervisor_api() call.
+# Reads ${SUPERVISOR_RESP_CODE_FILE} + ${SUPERVISOR_RESP_BODY_FILE} (written
+# by the most recent supervisor_api invocation, survives subshells).
+#
+#   $1 = prefix string (e.g. "Pre-sync HA backup API failed")
+#
+# Body output is truncated to 500 chars to avoid spamming the add-on log
+# with multi-page error pages, and newlines are collapsed so the line
+# stays grep-friendly.
+log_supervisor_error() {
+    local prefix="$1"
+    local code body
+    code=$(cat "${SUPERVISOR_RESP_CODE_FILE}" 2>/dev/null || echo "???")
+    body=$(head -c 500 "${SUPERVISOR_RESP_BODY_FILE}" 2>/dev/null | tr -d '\n' | tr -d '\r')
+
+    if [ "${code}" = "000" ]; then
+        bashio::log.error "${prefix} (no response — Supervisor unreachable)"
+        bashio::log.error "  Probable cause: add-on networking down, or 'http://supervisor' DNS failure"
+    elif [ -n "${body}" ]; then
+        bashio::log.error "${prefix} (HTTP ${code})"
+        bashio::log.error "  Supervisor response: ${body}"
+    else
+        bashio::log.error "${prefix} (HTTP ${code}, empty body)"
+    fi
 }
 
 # Audit configuration.yaml for !include_dir_* directives whose target
@@ -167,10 +234,11 @@ ha_backup_pre_sync() {
     # JSON body. addons=[] folders=["homeassistant"] compressed=true
     body=$(printf '{"name":"%s","addons":[],"folders":["homeassistant"],"compressed":true}' "${name}")
     if ! supervisor_api POST "/backups/new/partial" "${body}" > /dev/null; then
-        bashio::log.error "Pre-sync HA backup API failed — REFUSING to sync"
-        bashio::log.error "  Probable causes: backup integration not loaded, Supervisor unreachable,"
-        bashio::log.error "  insufficient disk space, or the partial-backup endpoint moved in HA."
-        bashio::log.error "  Diagnostic: 'ha core info' on the host, or check Supervisor logs."
+        log_supervisor_error "Pre-sync HA backup API failed — REFUSING to sync"
+        bashio::log.error "  Common causes for this endpoint:"
+        bashio::log.error "    HTTP 401/403 — add-on missing 'hassio_api: true' or 'hassio_role: backup' in config.yaml"
+        bashio::log.error "    HTTP 4xx     — backup integration not loaded, or request body schema changed"
+        bashio::log.error "    HTTP 5xx     — Supervisor internal error, or disk full"
         return 1
     fi
     bashio::log.info "Pre-sync HA backup '${name}' triggered — Settings → System → Backups"
@@ -195,14 +263,14 @@ ha_backup_pre_sync() {
 post_sync_verify() {
     bashio::log.debug "Post-sync verify: probe 1/2 — sun.sun state lookup"
     if ! supervisor_api GET "/core/api/states/sun.sun" > /dev/null; then
-        bashio::log.error "Post-sync probe 1 FAILED: sun.sun unreachable"
+        log_supervisor_error "Post-sync probe 1 FAILED: sun.sun unreachable"
         bashio::log.error "  HA may be down, restarting, or its state machine isn't serving."
         return 1
     fi
 
     bashio::log.debug "Post-sync verify: probe 2/2 — /core/api/ auth + responsiveness"
     if ! supervisor_api GET "/core/api/" > /dev/null; then
-        bashio::log.error "Post-sync probe 2 FAILED: /core/api/ unresponsive or auth rejected"
+        log_supervisor_error "Post-sync probe 2 FAILED: /core/api/ unresponsive or auth rejected"
         bashio::log.error "  Possible causes: auth provider broken, frontend assets missing,"
         bashio::log.error "  integration crashed during reload. THIS IS THE 2026-05-25 BUG CLASS."
         return 1
@@ -457,7 +525,10 @@ do_import() {
 
     # Validate config via Supervisor API
     CHECK_RESULT=$(supervisor_api POST "/core/api/config/core/check_config") || {
-        bashio::log.error "Import: check-config API unreachable — rolling back"
+        # supervisor_api wrote the HTTP code + body to temp files BEFORE
+        # the subshell exited — those survive into this branch, so the
+        # log_supervisor_error helper can read them here.
+        log_supervisor_error "Import: check-config API failed — rolling back"
         while IFS= read -r f; do
             [ -z "${f}" ] && continue
             [ -f "${BACKUP}/${f}" ] && cp "${BACKUP}/${f}" "${CONFIG_DIR}/${f}"
