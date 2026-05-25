@@ -1,5 +1,49 @@
 # Changelog
 
+## 1.5.1
+
+Sprint 4 P1 from the hardening plan (see issue #9): enforce the
+sync_paths gap at sync time so a PR can't slip through between
+add-on restarts. Structurally prevents the 2026-05-25 incident class.
+
+- **Feature (Sprint 4 P1)**: New `check_sync_paths_gap()` helper runs
+  early in `do_import()` (after `sync_log_open` + `status_mark_syncing`,
+  before pre-sync backup). Aborts the sync if the relevant
+  configuration.yaml has `!include_dir_*` directives targeting
+  directories not in `sync_paths` AND the current diff contains files
+  under those directories. Catches the exact failure mode from the
+  2026-05-25 incident: configuration.yaml had
+  `themes: !include_dir_merge_named themes/` but `themes/` was not in
+  `sync_paths`; PR added `themes/*.yaml` files; without this guard the
+  files were silently dropped and HA's frontend broke.
+- **Picks the right configuration.yaml**: If `configuration.yaml` is in
+  this sync's CHANGED list, the check audits the incoming repo version
+  (catches a PR that introduces a new gap directive). Otherwise it
+  audits the currently-active `/config` version (catches a PR that
+  adds files under an already-existing gap directive without modifying
+  configuration.yaml itself — the actual 2026-05-25 case).
+- **Diagnostic output on abort**: Emits a 12-line ERROR block
+  identifying (1) which gap directories trigger the abort, (2) which
+  files would be dropped (truncated to first 10 with overflow count),
+  and (3) a copy-paste-ready YAML snippet for the operator to add to
+  `sync_paths` in the add-on Configuration tab.
+- **All failure-path signals wired up**: `sync_log ERROR
+  event=sync_paths_gap result=abort` in the per-sync structured log;
+  `notify_sync_failure` raises the HA persistent_notification;
+  `status_mark_failure` sets `sensor.config_sync_status` to `failed`
+  with `last_error: "[sync_paths_gap] ..."`. After abort, git is
+  reset to LOCAL so the next cycle retries the same SHA once the
+  operator has fixed the gap.
+- **New option**: `strict_sync_paths_check: bool` (default `true`).
+  When `false`, the gap is logged loudly at ERROR but the sync
+  proceeds (matches v1.5.0 behavior). Default is `true` so existing
+  deployments get the protection automatically on update.
+- **Complements v1.1.7's `audit_include_dir_directives()`**, which
+  warns about sync_paths gaps at add-on STARTUP. The startup warning
+  is still useful for catching gaps the operator should fix before
+  the next sync; the new sync-time guard catches the case where a
+  PR introduces a new gap and lands without an add-on restart.
+
 ## 1.5.0
 
 Sprint 4 P0 from the hardening plan (see issue #9): expose sync state as

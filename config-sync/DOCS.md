@@ -12,17 +12,22 @@ back to GitHub automatically.
 2. Every `check_interval` seconds it runs `git fetch` to check for new commits.
 3. When new commits are found, it identifies which files changed.
 4. Only files matching your `sync_paths` allowlist are copied to `/config`.
-5. **A pre-sync HA backup is triggered** (named `gitops-pre-<short_sha>`)
+5. **sync_paths gap guard (v1.5.1+)**: if `configuration.yaml` has
+   `!include_dir_*` directives targeting directories not in `sync_paths`
+   AND this sync's diff has files under those directories, the sync is
+   aborted with a copy-paste fix recipe in the log. Configurable via
+   `strict_sync_paths_check`.
+6. **A pre-sync HA backup is triggered** (named `gitops-pre-<short_sha>`)
    covering the `homeassistant` folder. If the backup API fails, the sync
    aborts and rolls back the local git state so the next cycle retries.
-6. HA's config checker validates the result via the Supervisor API.
-7. If valid, HA reloads automatically.
-8. **Post-sync verification probes** check that HA's state machine and REST
+7. HA's config checker validates the result via the Supervisor API.
+8. If valid, HA reloads automatically.
+9. **Post-sync verification probes** check that HA's state machine and REST
    API are responsive after the reload. Either probe failing triggers
    file-level rollback + best-effort re-reload, and the operator is pointed
    at the named pre-sync backup for storage-level restore.
-9. If invalid at any step, the files are rolled back and the error is logged.
-10. The outcome is published to `sensor.config_sync_status` (v1.5.0+) so
+10. If invalid at any step, the files are rolled back and the error is logged.
+11. The outcome is published to `sensor.config_sync_status` (v1.5.0+) so
     the operator sees the result on dashboards and automations can react.
 
 ### Export (HA → GitHub)
@@ -51,6 +56,9 @@ When `export_enabled` is true:
 | `sync_paths` | No | See below | List of file/directory paths to sync |
 | `github_pat` | No | — | GitHub PAT — required for private repos and export (see below) |
 | `post_sync_settle_seconds` | No | `5` | Seconds to wait after `reload_all` before running verification probes. Bump for slow HA setups; 0 disables the settle delay. Range: 0–60. |
+| `restart_on_lovelace_change` | No | `true` | When `true`, calls `/core/restart` (instead of `reload_all`) when this sync touches the lovelace key in `configuration.yaml`. Required for new `lovelace.dashboards` entries to register — see Sprint 3 / v1.4.0. Disable only on latency-sensitive setups (with the known caveat that dashboard changes won't take effect without manual restart). |
+| `notify_on_failure` | No | `true` | When `true`, raises an HA persistent_notification on every sync failure and auto-dismisses it on the next healthy sync. Disable for headless deployments. |
+| `strict_sync_paths_check` | No | `true` | When `true` (v1.5.1+), aborts the sync if `configuration.yaml` has `!include_dir_*` directives targeting directories not in `sync_paths` AND the diff contains files under those directories. Prevents the 2026-05-25 incident class structurally. Set to `false` to log the gap loudly but continue the sync (v1.5.0 behavior). |
 
 ### Export options
 
@@ -77,16 +85,29 @@ Default paths:
 - `customize.yaml`
 - `packages/`
 - `dashboards/`
+- `scripts/`
 
 **⚠️ sync_paths gotcha:** if `configuration.yaml` contains a `!include_dir_*`
 directive pointing at a directory not in this list (e.g., `themes/`,
 `lovelace/`, `blueprints/`), files under that directory are silently
-skipped during sync. Add the directory to `sync_paths` and restart the
-add-on before merging PRs that add files under it.
+skipped during sync — unless `strict_sync_paths_check` (v1.5.1+) blocks
+the sync first. Add the directory to `sync_paths` and restart the add-on
+before merging PRs that add files under it.
 
-Since v1.1.7 the add-on detects this class of misconfiguration at startup
-and emits a WARNING per gap in the log; the warning includes the line
-number and a one-line remediation hint.
+Three layers of protection against this class of mistake:
+
+1. **v1.1.7 startup audit** — `audit_include_dir_directives()` scans
+   `configuration.yaml` at add-on startup and emits a WARNING per gap,
+   with line number and one-line remediation. Tells the operator about
+   gaps before they cause incidents.
+2. **v1.5.1 sync-time guard** — `check_sync_paths_gap()` runs at every
+   sync and ABORTS (default) if the current diff would silently drop
+   files referenced by an `!include_dir_*` directive. Prevents the
+   incident class even when the operator forgets to restart the add-on
+   after fixing the config.
+3. **strict_sync_paths_check** option — the v1.5.1 guard's default is
+   `true` (abort). Set to `false` to fall back to the v1.5.0 behavior
+   (log loudly, continue, let downstream check_config/reload catch it).
 
 ### GitHub Personal Access Token
 
@@ -197,7 +218,7 @@ sensor always shows the latest outcome.
 | `last_sync_at` | UTC ISO-8601 timestamp |
 | `last_sha_short` | 8-char target commit SHA |
 | `last_strategy` | `reload_all` / `reload_all_plus_themes` / `core_restart` (Sprint 3 reload key) |
-| `last_error` | Human-readable error text on failure, prefixed with `[stage]` (`pre_sync_backup`, `check_config_api`, `check_config_invalid`, `post_sync_verify`) |
+| `last_error` | Human-readable error text on failure, prefixed with `[stage]` (`pre_sync_backup`, `check_config_api`, `check_config_invalid`, `post_sync_verify`, `sync_paths_gap`) |
 | `last_backup_name` | Pre-sync HA backup name (e.g. `gitops-pre-abc12345`) for one-click restore |
 | `last_log_file` | Path to the per-sync structured log file for the run |
 | `sync_count` | Lifetime count of cycles that did real work |
@@ -321,6 +342,34 @@ diagnostic step. Examples:
 [config-sync]     HTTP 5xx     — Supervisor internal error, or disk full
 [config-sync] Aborting sync — rolling back git state to abc12345; next cycle will retry
 ```
+
+A v1.5.1 sync_paths gap abort looks like:
+
+```
+[config-sync] ============================================================
+[config-sync] SYNC ABORTED — sync_paths gap detected
+[config-sync] ============================================================
+[config-sync] configuration.yaml (/data/repo/configuration.yaml) has !include_dir_* directives
+[config-sync] targeting directories NOT in sync_paths:
+[config-sync]   themes/ 
+[config-sync] 
+[config-sync] This sync would update configuration.yaml's references but
+[config-sync] the sync_paths filter blocks 3 referenced file(s) from reaching /config.
+[config-sync] HA will see configuration.yaml pointing at files that don't exist on disk —
+[config-sync] frontend assets, themes, or lovelace dashboards may break.
+[config-sync] 
+[config-sync] Affected files (first 10):
+[config-sync]   - themes/dark.yaml
+[config-sync]   - themes/light.yaml
+[config-sync]   - themes/seasonal.yaml
+[config-sync] 
+[config-sync] Fix: open the add-on Configuration tab, add these to sync_paths:
+[config-sync]     - "themes/"
+[config-sync] Save the config and restart the add-on. The next sync will retry.
+[config-sync] ============================================================
+```
+
+Other failure examples:
 
 ```
 [config-sync] Import: config invalid: Integration 'nonexistent' not found
