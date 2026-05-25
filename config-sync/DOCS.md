@@ -22,6 +22,8 @@ back to GitHub automatically.
    file-level rollback + best-effort re-reload, and the operator is pointed
    at the named pre-sync backup for storage-level restore.
 9. If invalid at any step, the files are rolled back and the error is logged.
+10. The outcome is published to `sensor.config_sync_status` (v1.5.0+) so
+    the operator sees the result on dashboards and automations can react.
 
 ### Export (HA → GitHub)
 
@@ -151,7 +153,7 @@ To populate an empty repo with your current HA config:
 
 | Permission | Why | Since |
 |------------|-----|-------|
-| `homeassistant_api: true` | Core API access for `check_config`, `reload_all`, and the post-sync verification probes (`/core/api/states/*`, `/core/api/`) | 1.1.4 |
+| `homeassistant_api: true` | Core API access for `check_config`, `reload_all`, the post-sync verification probes (`/core/api/states/*`, `/core/api/`), and the v1.5.0 sync status sensor (`POST /core/api/states/sensor.config_sync_status`) | 1.1.4 |
 | `hassio_api: true` + `hassio_role: backup` | Supervisor API access for the pre-sync HA backup (`POST /backups/new/partial`). `backup` is the least-privilege role that grants the backups API; `manager` would also work but is broader than necessary. | 1.2.1 |
 | `map: config:rw` | Direct read/write to `/config` for the sync. | 1.0.0 |
 
@@ -169,9 +171,80 @@ To populate an empty repo with your current HA config:
 - **Export commits** are attributed to `HA Config Sync <config-sync@homeassistant.local>`
   for clear audit trail in git history.
 
-## Logs
+## Observability
 
-Check the **Log** tab in the add-on panel for the rolling add-on log.
+The add-on surfaces sync state in four places, ordered from most operator-
+friendly to most diagnostic-detailed.
+
+### sensor.config_sync_status (v1.5.0+)
+
+First-class HA entity that reflects the most recent sync outcome. Visible in
+Developer Tools → States, addable to any dashboard, subscribable by
+automations, and queryable by external tooling (NanoClaw `agent-homeops`,
+Node-RED, etc) via the standard `/core/api/states/sensor.config_sync_status`
+endpoint.
+
+**States**: `idle` (boot, before any sync) → `syncing` (during do_import) →
+`success` | `failed`. Stays on the terminal state between cycles so the
+sensor always shows the latest outcome.
+
+**Attributes:**
+
+| Attribute | Description |
+|---|---|
+| `friendly_name` | Always `"Config Sync Status"` |
+| `icon` | `mdi:cloud-check` (success), `mdi:cloud-alert` (failed), `mdi:cloud-sync` (idle/syncing) |
+| `last_sync_at` | UTC ISO-8601 timestamp |
+| `last_sha_short` | 8-char target commit SHA |
+| `last_strategy` | `reload_all` / `reload_all_plus_themes` / `core_restart` (Sprint 3 reload key) |
+| `last_error` | Human-readable error text on failure, prefixed with `[stage]` (`pre_sync_backup`, `check_config_api`, `check_config_invalid`, `post_sync_verify`) |
+| `last_backup_name` | Pre-sync HA backup name (e.g. `gitops-pre-abc12345`) for one-click restore |
+| `last_log_file` | Path to the per-sync structured log file for the run |
+| `sync_count` | Lifetime count of cycles that did real work |
+| `failure_count` | Lifetime count of failed cycles |
+
+**Recommended dashboard card:**
+
+```yaml
+type: tile
+entity: sensor.config_sync_status
+show_entity_picture: false
+```
+
+**Recommended automation — ping on failure:**
+
+```yaml
+alias: Notify on Config Sync failure
+trigger:
+  - platform: state
+    entity_id: sensor.config_sync_status
+    to: failed
+action:
+  - service: notify.telegram
+    data:
+      message: |
+        Config Sync failed at {{ state_attr('sensor.config_sync_status', 'last_sync_at') }}
+        SHA: {{ state_attr('sensor.config_sync_status', 'last_sha_short') }}
+        Error: {{ state_attr('sensor.config_sync_status', 'last_error') }}
+        Restore backup: {{ state_attr('sensor.config_sync_status', 'last_backup_name') }}
+```
+
+### /data/sync_status.json (v1.5.0+)
+
+Mirror of the sensor's state + attributes, written to the add-on's persistent
+storage. Survives add-on restart and upgrade. Used internally to restore
+lifetime counters across reboots, and externally by headless tooling that
+doesn't have HA API access.
+
+Operator access:
+
+```
+docker exec -it addon_<slug>_config-sync cat /data/sync_status.json | jq
+```
+
+### Rolling add-on log
+
+Check the **Log** tab in the add-on panel for the live log stream.
 
 ### Per-sync structured log (v1.4.1+)
 
@@ -188,7 +261,7 @@ Each file captures every major waypoint with `event=` keys:
 2026-05-26T03:14:09Z [INFO] event=backup result=triggered name=gitops-pre-def67890
 2026-05-26T03:14:10Z [INFO] event=reconcile copied=0 failed=0
 2026-05-26T03:14:11Z [INFO] event=check_config result=valid
-2026-05-26T03:14:11Z [INFO] event=reload strategy=reload_all reason=no_lovelace_no_themes
+2026-05-26T03:14:11Z [INFO] event=reload strategy=reload_all reason=default
 2026-05-26T03:14:17Z [INFO] event=verify probe=sun.sun result=pass
 2026-05-26T03:14:17Z [INFO] event=verify probe=core_api result=pass
 2026-05-26T03:14:17Z [INFO] event=sync_end result=success
@@ -204,7 +277,9 @@ docker exec -it addon_<slug>_config-sync cat /data/logs/sync/<filename>.log
 Use this when investigating a past sync that the rolling log has scrolled
 past, or when reconstructing the exact sequence around a known-bad commit.
 The `/data/` mount is persistent across add-on restarts and upgrades, so
-the log history survives a container rebuild.
+the log history survives a container rebuild. The path of the latest
+file is also exposed as the `last_log_file` attribute on
+`sensor.config_sync_status` for direct lookup.
 
 If `mkdir` on the log directory fails (e.g. disk full), the cycle logs a
 WARNING to the rolling add-on log and continues — per-sync logging is
@@ -270,16 +345,20 @@ with full diagnostic context.
 
 ## Agent integration
 
-The add-on can be managed programmatically via the HA Supervisor API.
-Any agent or automation platform that can call the HA REST API can:
+The add-on can be managed and observed programmatically. Any agent or
+automation platform that can call the HA REST API can:
 
-- Read/change add-on options: `GET/POST /addons/config-sync/options`
-- Start/stop/restart: `POST /addons/config-sync/{start,stop,restart}`
-- Read logs: `GET /addons/config-sync/logs`
-- Check status: `GET /addons/config-sync/info`
+- **Subscribe to sync state** (v1.5.0+): `GET /core/api/states/sensor.config_sync_status` returns the current state + attributes; use the standard HA state-change WebSocket for push.
+- **Read add-on options**: `GET/POST /addons/config-sync/options`
+- **Start/stop/restart**: `POST /addons/config-sync/{start,stop,restart}`
+- **Read add-on logs**: `GET /addons/config-sync/logs`
+- **Check add-on status**: `GET /addons/config-sync/info`
 
 To trigger an on-demand export, an agent can restart the add-on — the
 initial export runs on every startup when `export_enabled` is true.
 
 This makes it compatible with NanoClaw's `agent-homeops`, Home Assistant
-automations, or any future agent platform.
+automations, or any future agent platform. NanoClaw `agent-homeops` is
+the intended primary consumer of `sensor.config_sync_status` — it polls
+the state and surfaces failures via the Telegram channel without needing
+`docker exec` into the add-on container.

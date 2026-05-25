@@ -3,7 +3,7 @@
 # Source the bashio library (HA add-on option parsing + logging)
 source /usr/lib/bashio/bashio.sh
 # ---------------------------------------------------------------
-# Config Sync (GitOps) — HA Supervisor Add-on  v1.4.1
+# Config Sync (GitOps) — HA Supervisor Add-on  v1.5.0
 #
 # Bidirectional sync:
 #   IMPORT — pull config from GitHub → backup HA → validate → reload → verify
@@ -90,6 +90,18 @@ SYNC_LOG_MAX_FILES=20
 # helpers (e.g. post_sync_verify) without needing to plumb the file
 # path through arguments.
 SYNC_LOG_FILE=""
+
+# Sync status JSON + HA sensor entity (v1.5.0).
+# After every cycle, sync state is published to:
+#   1. /data/sync_status.json — persistent JSON snapshot, survives
+#      restart + upgrade. Holds the lifetime counters that get restored
+#      on next boot. Operator access via `docker exec ... cat`.
+#   2. sensor.config_sync_status — HA entity, first-class state with
+#      attributes. Can be put on a dashboard, triggered on by
+#      automations (e.g. ping Telegram on failure), polled by
+#      agent-homeops over the standard /core/api/states API.
+STATUS_FILE="/data/sync_status.json"
+STATUS_SENSOR_ENTITY="sensor.config_sync_status"
 
 # Default export branch to the sync branch if not set
 if [ -z "${EXPORT_BRANCH}" ]; then
@@ -203,6 +215,166 @@ sync_log_close() {
                 rm -f "${SYNC_LOG_DIR}/${old}" 2>/dev/null || true
             done
     fi
+}
+
+# ────────────────────────────────────────────────────────────────────
+#  Sync status emitter (v1.5.0)
+# ────────────────────────────────────────────────────────────────────
+# Publishes the most recent sync outcome to two places:
+#   1. /data/sync_status.json — persistent JSON snapshot. Survives add-on
+#      restart + upgrade. Holds lifetime counters (sync_count, failure_count).
+#      Operator access: `docker exec ... cat /data/sync_status.json`.
+#   2. sensor.config_sync_status — first-class HA state with attributes.
+#      Can be put on a dashboard, triggered on, polled by agent-homeops
+#      via the standard /core/api/states API.
+#
+# Single emitter (status_record) for both. Lifecycle helpers
+# (status_mark_idle / _syncing / _success / _failure) wrap it for the
+# canonical states. Both writes are best-effort — IO/API failures log
+# WARN/DEBUG but NEVER block or break a sync.
+# ────────────────────────────────────────────────────────────────────
+
+# Read the persisted counters from STATUS_FILE. Echoes two space-
+# separated numbers: "<sync_count> <failure_count>". Defaults to "0 0"
+# if the file is missing, unparseable, or jq is unhappy.
+status_load_counters() {
+    if [ ! -f "${STATUS_FILE}" ]; then
+        echo "0 0"
+        return 0
+    fi
+    local sc fc
+    sc=$(jq -r '.attributes.sync_count // 0' "${STATUS_FILE}" 2>/dev/null)
+    fc=$(jq -r '.attributes.failure_count // 0' "${STATUS_FILE}" 2>/dev/null)
+    [ -z "${sc}" ] && sc=0
+    [ -z "${fc}" ] && fc=0
+    echo "${sc} ${fc}"
+}
+
+# Record a sync status event. Writes /data/sync_status.json with the
+# full payload, then POSTs to the HA sensor entity. Both writes are
+# best-effort — failures log warnings but do not propagate.
+#
+#   $1 = state              ("idle" / "syncing" / "success" / "failed")
+#   $2 = last_sha_short     (8 chars, or "" for idle)
+#   $3 = last_strategy      ("reload_all" / "reload_all_plus_themes" /
+#                            "core_restart" / "" for idle/syncing)
+#   $4 = last_error         (string, or "" if not applicable)
+#   $5 = last_backup_name   (string, or "" if not applicable)
+#   $6 = last_log_file      (path, or "" if not applicable)
+#   $7 = increment_sync     ("true" to bump sync_count, else "")
+#   $8 = increment_failure  ("true" to bump failure_count, else "")
+status_record() {
+    local state="${1:-idle}"
+    local last_sha="${2:-}"
+    local last_strategy="${3:-}"
+    local last_error="${4:-}"
+    local last_backup="${5:-}"
+    local last_log_file="${6:-}"
+    local incr_sync="${7:-}"
+    local incr_failure="${8:-}"
+
+    local counters sc fc
+    counters=$(status_load_counters)
+    sc=$(echo "${counters}" | awk '{print $1}')
+    fc=$(echo "${counters}" | awk '{print $2}')
+
+    if [ "${incr_sync}" = "true" ]; then
+        sc=$((sc + 1))
+    fi
+    if [ "${incr_failure}" = "true" ]; then
+        fc=$((fc + 1))
+    fi
+
+    local ts icon
+    ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+    case "${state}" in
+        success) icon="mdi:cloud-check" ;;
+        failed)  icon="mdi:cloud-alert" ;;
+        syncing) icon="mdi:cloud-sync" ;;
+        *)       icon="mdi:cloud-sync" ;;
+    esac
+
+    # Build the JSON payload once; reuse for both disk + HA write.
+    # jq -n is the only safe way — strings can contain quotes, newlines,
+    # backslashes (error messages from check_config, especially).
+    local payload
+    payload=$(jq -nc \
+        --arg state "${state}" \
+        --arg last_sync_at "${ts}" \
+        --arg last_sha_short "${last_sha}" \
+        --arg last_strategy "${last_strategy}" \
+        --arg last_error "${last_error}" \
+        --arg last_backup_name "${last_backup}" \
+        --arg last_log_file "${last_log_file}" \
+        --argjson sync_count "${sc}" \
+        --argjson failure_count "${fc}" \
+        --arg friendly_name "Config Sync Status" \
+        --arg icon "${icon}" \
+        '{
+            state: $state,
+            attributes: {
+                friendly_name: $friendly_name,
+                icon: $icon,
+                last_sync_at: $last_sync_at,
+                last_sha_short: $last_sha_short,
+                last_strategy: $last_strategy,
+                last_error: $last_error,
+                last_backup_name: $last_backup_name,
+                last_log_file: $last_log_file,
+                sync_count: $sync_count,
+                failure_count: $failure_count
+            }
+        }' 2>/dev/null)
+
+    if [ -z "${payload}" ]; then
+        bashio::log.warning "status_record: failed to build JSON payload (jq error)"
+        return 0
+    fi
+
+    # Write JSON snapshot to disk atomically (.tmp + rename) so a
+    # partial-write doesn't poison the counter file.
+    if ! echo "${payload}" > "${STATUS_FILE}.tmp" 2>/dev/null; then
+        bashio::log.warning "status_record: failed to write ${STATUS_FILE}.tmp"
+    else
+        mv "${STATUS_FILE}.tmp" "${STATUS_FILE}" 2>/dev/null || true
+    fi
+
+    # Publish to HA sensor entity. Best-effort — sensor write failure
+    # is a known harmless condition during HA restart (Sprint 3
+    # /core/restart strategy), so log at DEBUG not WARN.
+    if ! supervisor_api POST "/core/api/states/${STATUS_SENSOR_ENTITY}" "${payload}" > /dev/null; then
+        bashio::log.debug "status_record: failed to publish to ${STATUS_SENSOR_ENTITY} (HA may be restarting)"
+    fi
+    return 0
+}
+
+# Lifecycle wrappers. Each takes the minimum args needed; the rest
+# default to "" inside status_record.
+
+status_mark_idle() {
+    status_record "idle" "" "" "" "" "" "" ""
+}
+
+status_mark_syncing() {
+    local target_sha="$1"
+    status_record "syncing" "${target_sha:0:8}" "" "" "" "${SYNC_LOG_FILE}" "" ""
+}
+
+status_mark_success() {
+    local target_sha="$1" strategy="$2" backup_name="$3"
+    status_record "success" "${target_sha:0:8}" "${strategy}" "" "${backup_name}" "${SYNC_LOG_FILE}" "true" ""
+}
+
+# Failure path — bumps both sync_count and failure_count.
+#   $1 = target_sha
+#   $2 = stage  (e.g. "pre_sync_backup", "check_config", "post_sync_verify")
+#   $3 = error_text (human-readable, shown in last_error attribute)
+#   $4 = backup_name (or "" if not applicable / pre-backup failure)
+status_mark_failure() {
+    local target_sha="$1" stage="$2" error_text="$3" backup_name="$4"
+    local err
+    err="[${stage}] ${error_text}"
+    status_record "failed" "${target_sha:0:8}" "" "${err}" "${backup_name}" "${SYNC_LOG_FILE}" "true" "true"
 }
 
 # Call the Supervisor API and capture both the response body AND the
@@ -574,6 +746,12 @@ bashio::log.info "Sync paths: ${SYNC_PATHS[*]}"
 # instead of via post-hoc operator discovery. See function comment.
 audit_include_dir_directives
 
+# Seed the sync status sensor + JSON snapshot on startup (v1.5.0).
+# State = idle; counters preserved from prior runs if the file exists.
+# This makes sensor.config_sync_status available in HA immediately,
+# even before the first real sync cycle runs.
+status_mark_idle
+
 # ================================================================
 #  EXPORT FUNCTIONS
 # ================================================================
@@ -790,6 +968,15 @@ do_import() {
     # return point below.
     sync_log_open "${LOCAL}" "${REMOTE}"
 
+    # Mark sensor.config_sync_status = "syncing" before any work begins,
+    # so HA dashboards / automations see the in-progress state. Done
+    # AFTER sync_log_open so the last_log_file attribute is populated.
+    status_mark_syncing "${REMOTE}"
+
+    # Deterministic backup name — also referenced by failure paths
+    # in the status_mark_failure attribute payload.
+    local backup_name="gitops-pre-${REMOTE:0:8}"
+
     bashio::log.info "Import: syncing $(echo "${CHANGED}" | tr '\n' ' ')"
     sync_log INFO "event=files_changed count=$(echo "${CHANGED}" | wc -l | tr -d ' ') paths=$(echo "${CHANGED}" | tr '\n' ',' | sed 's/,$//')"
 
@@ -803,6 +990,9 @@ do_import() {
         notify_sync_failure \
             "Config Sync: pre-sync backup failed" \
             "The add-on could not take an HA backup before syncing ${REMOTE:0:8}. Sync aborted and will retry next cycle. Check the add-on log for the Supervisor error response."
+        status_mark_failure "${REMOTE}" "pre_sync_backup" \
+            "Supervisor backups/new/partial API rejected the request (HTTP $(cat "${SUPERVISOR_RESP_CODE_FILE}" 2>/dev/null || echo ???)); sync aborted" \
+            ""
         sync_log_close failure
         return 1
     fi
@@ -856,6 +1046,9 @@ do_import() {
             "Config Sync: check_config API unreachable" \
             "Tried to validate ${REMOTE:0:8} but the Supervisor check_config endpoint did not respond. Sync rolled back to ${LOCAL:0:8}. Check the add-on log for the Supervisor error response."
         sync_log ERROR "event=check_config result=api_failed http_code=$(cat "${SUPERVISOR_RESP_CODE_FILE}" 2>/dev/null || echo ???)"
+        status_mark_failure "${REMOTE}" "check_config_api" \
+            "Supervisor check_config endpoint did not respond (HTTP $(cat "${SUPERVISOR_RESP_CODE_FILE}" 2>/dev/null || echo ???)); rolled back to ${LOCAL:0:8}" \
+            "${backup_name}"
         sync_log_close failure
         return 1
     }
@@ -872,10 +1065,13 @@ do_import() {
         #
         # See sync_touches_lovelace() / sync_touches_themes() for the
         # detection heuristics. Logged so the operator can see WHY a
-        # given strategy was used.
-        local reload_strategy reload_settle
+        # given strategy was used. reload_strategy_key is the canonical
+        # short form used by the status sensor + per-sync log; the
+        # human-readable reload_strategy is for log messages only.
+        local reload_strategy reload_strategy_key reload_settle
         if [ "${RESTART_ON_LOVELACE_CHANGE}" = "true" ] && sync_touches_lovelace; then
             reload_strategy="/core/restart"
+            reload_strategy_key="core_restart"
             reload_settle=$((POST_SYNC_SETTLE + RESTART_EXTRA_SETTLE))
             bashio::log.info "Import: configuration.yaml lovelace block changed — calling /core/restart (reload_all does NOT re-register dashboards)"
             sync_log INFO "event=reload strategy=core_restart reason=lovelace_changed"
@@ -886,6 +1082,7 @@ do_import() {
             fi
         elif sync_touches_themes; then
             reload_strategy="reload_all + frontend.reload_themes"
+            reload_strategy_key="reload_all_plus_themes"
             reload_settle="${POST_SYNC_SETTLE}"
             bashio::log.info "Import: themes/ files changed — calling reload_all + frontend.reload_themes"
             sync_log INFO "event=reload strategy=reload_all_plus_themes reason=themes_changed"
@@ -900,6 +1097,7 @@ do_import() {
             fi
         else
             reload_strategy="reload_all"
+            reload_strategy_key="reload_all"
             reload_settle="${POST_SYNC_SETTLE}"
             bashio::log.info "Import: config valid — reloading Home Assistant"
             sync_log INFO "event=reload strategy=reload_all reason=default"
@@ -947,6 +1145,9 @@ do_import() {
             notify_sync_failure \
                 "Config Sync: post-sync verification failed" \
                 "Applied ${reload_strategy} for ${REMOTE:0:8} but HA failed health probes afterward. Files rolled back to ${LOCAL:0:8}. **If HA is still broken, restore backup \`gitops-pre-${REMOTE:0:8}\`** via Settings → System → Backups. Check the add-on log for the failed probe details."
+            status_mark_failure "${REMOTE}" "post_sync_verify" \
+                "Post-${reload_strategy_key} health probes failed; rolled back to ${LOCAL:0:8}. Restore backup ${backup_name} if HA is still broken." \
+                "${backup_name}"
             sync_log_close failure
             return 1
         fi
@@ -957,6 +1158,10 @@ do_import() {
         # Healthy sync completed — dismiss any prior failure notification
         # so the operator's UI is clean.
         notify_sync_recovered
+        # Publish success to sensor.config_sync_status BEFORE close so
+        # the sensor's last_log_file attribute still references the
+        # active log file path. sync_log_close clears SYNC_LOG_FILE.
+        status_mark_success "${REMOTE}" "${reload_strategy_key}" "${backup_name}"
         sync_log_close success
     else
         ERROR_MSG=$(echo "${CHECK_RESULT}" | jq -r '.errors // .message // "unknown error"' 2>/dev/null)
@@ -975,6 +1180,9 @@ do_import() {
         # then returns 0 from do_import (we recovered cleanly). Per-sync
         # log records the failure outcome.
         sync_log ERROR "event=check_config result=invalid"
+        status_mark_failure "${REMOTE}" "check_config_invalid" \
+            "HA's check_config rejected ${REMOTE:0:8}: ${ERROR_MSG}" \
+            "${backup_name}"
         sync_log_close failure
     fi
 

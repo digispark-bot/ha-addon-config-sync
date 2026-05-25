@@ -1,5 +1,77 @@
 # Changelog
 
+## 1.5.0
+
+Sprint 4 P0 from the hardening plan (see issue #9): expose sync state as
+a first-class HA sensor entity so operators, automations, and agents can
+subscribe to sync outcomes without scraping the rolling add-on log.
+
+- **Feature (Sprint 4 P0)**: After every sync cycle (success or failure),
+  the add-on publishes the outcome to TWO places:
+  - `sensor.config_sync_status` — first-class HA entity via
+    `POST /core/api/states/sensor.config_sync_status`. Appears in HA
+    natively (Developer Tools → States) and can be added to any dashboard
+    (recommended: tile card). Subscribable by automations — e.g. trigger
+    a Telegram notification when state goes to `failed`. Polled by
+    `agent-homeops` via the standard `/core/api/states/<entity>` endpoint.
+  - `/data/sync_status.json` — persistent JSON snapshot inside the add-on
+    container. Survives add-on restart + upgrade. Used to restore
+    lifetime counters on next boot, and for headless / non-HA-accessible
+    tooling that needs the same data via `docker exec`.
+- **State machine**: `idle` (boot, seeded once on add-on start) →
+  `syncing` (set at start of every do_import cycle that has changes) →
+  `success` | `failed` (set at the end of that cycle). The `syncing`
+  state gives dashboards a real-time view of work-in-progress; the
+  terminal states persist between cycles so the sensor always reflects
+  the most recent outcome.
+- **Attributes published with every state change**:
+  - `friendly_name`: "Config Sync Status"
+  - `icon`: `mdi:cloud-check` (success), `mdi:cloud-alert` (failed),
+    `mdi:cloud-sync` (idle / syncing). Operator sees obvious red/green
+    at-a-glance.
+  - `last_sync_at`: UTC ISO-8601 timestamp.
+  - `last_sha_short`: 8-char target commit SHA.
+  - `last_strategy`: `reload_all` | `reload_all_plus_themes` |
+    `core_restart` (matches the Sprint 3 reload-strategy keys).
+  - `last_error`: human-readable error text on failure, with a
+    `[stage]` prefix identifying where in the pipeline the failure
+    occurred (`pre_sync_backup`, `check_config_api`,
+    `check_config_invalid`, `post_sync_verify`).
+  - `last_backup_name`: name of the most recent pre-sync HA backup
+    (e.g. `gitops-pre-abc12345`), so the operator can copy-paste it
+    straight from the sensor attribute into Settings → System →
+    Backups for a one-click restore on catastrophic failure.
+  - `last_log_file`: path to the v1.4.1 per-sync structured log file
+    for the most recent run (e.g.
+    `/data/logs/sync/2026-05-25T19-30-00Z-abc12345.log`). Direct
+    pointer to the full event trace for the surfaced state.
+  - `sync_count`: lifetime counter; bumps on every cycle that did
+    real work (success OR failure), preserved across add-on restart
+    via the JSON snapshot.
+  - `failure_count`: lifetime counter; bumps only on failure.
+    Operators can compute the failure rate from these two numbers.
+- **New helpers**: `status_record()` is the single emitter; lifecycle
+  wrappers (`status_mark_idle`, `status_mark_syncing`,
+  `status_mark_success`, `status_mark_failure`) call it with the
+  right state and bump flags. `status_load_counters()` reads
+  persisted counters from the JSON snapshot at every cycle so the
+  count is durable across add-on restart.
+- **Resilience**: Both the disk write (`echo > .tmp && mv`) and the
+  sensor publish (`supervisor_api POST`) are best-effort. Failures
+  log a `WARN` (disk) or `DEBUG` (sensor — expected during HA
+  restart in the Sprint 3 strategy) and never propagate. Status
+  reporting must never block or break a sync.
+- **No new config options**; no schema changes. No new permissions —
+  `homeassistant_api: true` already grants
+  `POST /core/api/states/sensor.*`. Comment in `config.yaml` updated
+  to document the new endpoint use.
+- **Recommended dashboard card**:
+  ```yaml
+  type: tile
+  entity: sensor.config_sync_status
+  show_entity_picture: false
+  ```
+
 ## 1.4.1
 
 Sprint 3 P1 from the hardening plan (see issue #9): per-sync structured log
