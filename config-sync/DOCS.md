@@ -29,6 +29,9 @@ back to GitHub automatically.
 10. If invalid at any step, the files are rolled back and the error is logged.
 11. The outcome is published to `sensor.config_sync_status` (v1.5.0+) so
     the operator sees the result on dashboards and automations can react.
+12. **Old `gitops-pre-*` backups are pruned (v1.5.2+)**: the add-on keeps
+    the most-recent `pre_sync_backup_retention` (default 7) and deletes the
+    rest. The just-created backup is always in the keep set.
 
 ### Export (HA → GitHub)
 
@@ -59,6 +62,7 @@ When `export_enabled` is true:
 | `restart_on_lovelace_change` | No | `true` | When `true`, calls `/core/restart` (instead of `reload_all`) when this sync touches the lovelace key in `configuration.yaml`. Required for new `lovelace.dashboards` entries to register — see Sprint 3 / v1.4.0. Disable only on latency-sensitive setups (with the known caveat that dashboard changes won't take effect without manual restart). |
 | `notify_on_failure` | No | `true` | When `true`, raises an HA persistent_notification on every sync failure and auto-dismisses it on the next healthy sync. Disable for headless deployments. |
 | `strict_sync_paths_check` | No | `true` | When `true` (v1.5.1+), aborts the sync if `configuration.yaml` has `!include_dir_*` directives targeting directories not in `sync_paths` AND the diff contains files under those directories. Prevents the 2026-05-25 incident class structurally. Set to `false` to log the gap loudly but continue the sync (v1.5.0 behavior). |
+| `pre_sync_backup_retention` | No | `7` | How many `gitops-pre-*` HA backups to keep (v1.5.2+). After every sync that took a backup, the add-on prunes anything past the Nth most recent. The just-created backup is always in the keep set. Set to `0` to disable pruning (v1.5.1 behavior — backups accumulate forever). Range: 0–50. |
 
 ### Export options
 
@@ -168,6 +172,38 @@ To populate an empty repo with your current HA config:
 3. The initial export commits all `sync_paths` files to the repo
 4. Optionally disable export afterward if you only want one-way import
 
+## Pre-sync backup retention (v1.5.2+)
+
+Every sync that proceeds past the gap-guard takes a partial HA backup named
+`gitops-pre-<short_sha>` covering the `homeassistant` folder. By default the
+add-on retains the most-recent 7 of these and deletes the rest, so backups
+don't accumulate forever.
+
+**How it works:**
+
+- Pruning runs at the end of every `do_import()` cycle that took a backup
+  (success path, `check_config_invalid` fall-through, `check_config_api`
+  failure, `post_sync_verify` failure).
+- Backups are listed via `GET /backups`, filtered to names starting with
+  `gitops-pre-`, sorted by date descending, and anything past the Nth
+  most recent is deleted via `DELETE /backups/<slug>`.
+- The just-created backup is always the most recent by date, so it's never
+  deleted in the same cycle that created it — even on a failed sync where
+  the operator needs that exact backup for restore.
+- Failures of the list/delete API are logged at DEBUG/WARN respectively
+  and never propagate. The retention pass is strictly best-effort.
+
+**Disabling retention:**
+
+Set `pre_sync_backup_retention: 0` to revert to the v1.5.1 behavior
+(backups accumulate forever). Useful if you want HA's own backup retention
+policy to manage them, or if you keep a long compliance trail.
+
+**Naming caveat:** the prefix match is `gitops-pre-` against the backup
+`.name`. If you happen to create a backup of your own with that prefix
+(unusual), it will be subject to the retention sweep too. Use a different
+name for manual backups you want to keep.
+
 ## Security
 
 ### Permissions the add-on requests
@@ -175,7 +211,7 @@ To populate an empty repo with your current HA config:
 | Permission | Why | Since |
 |------------|-----|-------|
 | `homeassistant_api: true` | Core API access for `check_config`, `reload_all`, the post-sync verification probes (`/core/api/states/*`, `/core/api/`), and the v1.5.0 sync status sensor (`POST /core/api/states/sensor.config_sync_status`) | 1.1.4 |
-| `hassio_api: true` + `hassio_role: backup` | Supervisor API access for the pre-sync HA backup (`POST /backups/new/partial`). `backup` is the least-privilege role that grants the backups API; `manager` would also work but is broader than necessary. | 1.2.1 |
+| `hassio_api: true` + `hassio_role: backup` | Supervisor API access for the pre-sync HA backup (`POST /backups/new/partial`) and the v1.5.2 backup retention sweep (`GET /backups` + `DELETE /backups/<slug>`). `backup` is the least-privilege role that grants the backups API — covers list + delete in addition to create. `manager` would also work but is broader than necessary. | 1.2.1 |
 | `map: config:rw` | Direct read/write to `/config` for the sync. | 1.0.0 |
 
 ### General security posture
@@ -285,7 +321,8 @@ Each file captures every major waypoint with `event=` keys:
 2026-05-26T03:14:11Z [INFO] event=reload strategy=reload_all reason=default
 2026-05-26T03:14:17Z [INFO] event=verify probe=sun.sun result=pass
 2026-05-26T03:14:17Z [INFO] event=verify probe=core_api result=pass
-2026-05-26T03:14:17Z [INFO] event=sync_end result=success
+2026-05-26T03:14:18Z [INFO] event=backup_prune retention=7 deleted=1 failed=0
+2026-05-26T03:14:18Z [INFO] event=sync_end result=success
 ```
 
 Operator access:
@@ -315,6 +352,7 @@ best-effort and never blocks a sync.
 [config-sync] Import: config valid — reloading Home Assistant
 [config-sync] Import: reload complete (abc12345 -> def67890)
 [config-sync] Post-sync verify: both probes passed — sync verified healthy
+[config-sync] Pre-sync backup retention: pruned 1, failed 0 (keeping last 7)
 ```
 
 ### Export logs

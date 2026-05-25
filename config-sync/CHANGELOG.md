@@ -1,5 +1,47 @@
 # Changelog
 
+## 1.5.2
+
+Sprint 4 P2 from the hardening plan (see issue #9): bound the number
+of `gitops-pre-*` HA backups the add-on accumulates. Before v1.5.2,
+every sync left a pre-sync backup forever; on a busy sync day this
+could reach 10+ backups by evening with no automatic cleanup.
+
+- **Feature (Sprint 4 P2)**: New `prune_pre_sync_backups()` helper
+  enumerates HA backups via `GET /backups`, filters to names starting
+  with `gitops-pre-`, sorts by `.date` descending, and deletes
+  everything past the Nth most recent via `DELETE /backups/<slug>`.
+  Called in every `do_import()` path that actually took a backup:
+  - Success path cleanup (after success + check_config_invalid
+    fall-through) — the common case.
+  - `check_config_api` failure (inline before `return 1`).
+  - `post_sync_verify` failure (inline before `return 1`).
+- **New option**: `pre_sync_backup_retention: int(0,50)` (default `7`).
+  `0` disables pruning entirely (v1.5.1 behavior — backups accumulate
+  forever). Default of 7 covers roughly a week of one-sync-per-day
+  deploys.
+- **Just-created backup never deleted in same cycle**: pruning runs
+  AFTER the new backup is taken, and the date-desc sort puts the
+  freshest one at index 0. With `retention >= 1`, the just-created
+  backup is always in the keep set — even on a failed sync where the
+  operator needs that exact backup for restore.
+- **Best-effort throughout**: a failed list (`GET /backups`) logs DEBUG
+  and returns; a failed delete logs WARN with HTTP code and continues
+  to the next slug. Status reporting / sync flow never blocked by
+  retention failures.
+- **Diagnostic signal**: each prune cycle that actually deletes
+  anything (or fails to) emits an INFO log line
+  `Pre-sync backup retention: pruned N, failed M (keeping last K)`
+  and a structured-log event `event=backup_prune retention=K deleted=N
+  failed=M`. Quiet on no-op cycles so the log isn't spammed.
+- **No new permissions**: `hassio_api: true` + `hassio_role: backup`
+  already cover list + delete on the backups endpoint. Comment in
+  `config.yaml` updated to document the new endpoint use.
+- **Implementation detail**: prefix matching is `startswith("gitops-pre-")`
+  on `.name`. Operator backups with that prefix would be caught too —
+  unlikely in practice, but worth knowing if you happen to name your
+  own backups that way.
+
 ## 1.5.1
 
 Sprint 4 P1 from the hardening plan (see issue #9): enforce the
