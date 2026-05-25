@@ -3,7 +3,7 @@
 # Source the bashio library (HA add-on option parsing + logging)
 source /usr/lib/bashio/bashio.sh
 # ---------------------------------------------------------------
-# Config Sync (GitOps) — HA Supervisor Add-on  v1.1.6
+# Config Sync (GitOps) — HA Supervisor Add-on  v1.1.7
 #
 # Bidirectional sync:
 #   IMPORT — pull config from GitHub → validate → reload HA
@@ -87,6 +87,49 @@ supervisor_api() {
         2>/dev/null
 }
 
+# Audit configuration.yaml for !include_dir_* directives whose target
+# directory is NOT in sync_paths. Such directives produce silent sync
+# skips on the referenced files (the add-on logs "Import: skipped (not
+# in sync_paths)" but HA can't find the files; frontend assets break).
+#
+# Runs once at startup. Emits a bashio::log.warning per gap with the
+# file:line and a one-line remediation. No-op if configuration.yaml
+# is unreadable.
+#
+# See: GitHub issue #3, and the JLay2026/nanoclaw-zimaos#50 incident.
+audit_include_dir_directives() {
+    local cfg="${CONFIG_DIR}/configuration.yaml"
+    if [ ! -r "${cfg}" ]; then
+        bashio::log.debug "audit: ${cfg} unreadable — skipping include_dir_* audit"
+        return 0
+    fi
+
+    local found_gaps=0
+    # grep -nE matches the four canonical include_dir_* directives followed
+    # by at least one path char. The path argument is the last whitespace-
+    # separated token before any inline comment.
+    while IFS= read -r line; do
+        local lineno content arg norm
+        lineno="${line%%:*}"
+        content="${line#*:}"
+        # Extract path arg via sed; strip optional quotes.
+        arg=$(echo "${content}" | sed -E 's/.*!include_dir_(named|list|merge_named|merge_list)[[:space:]]+"?([^"[:space:]#]+)"?.*/\2/')
+        # Normalize: ensure trailing slash for the allowlist check.
+        norm="${arg%/}/"
+        # Probe with a synthetic file inside the directory.
+        if ! path_allowed "${norm}_audit_probe.yaml"; then
+            bashio::log.warning "sync_paths gap: configuration.yaml line ${lineno} uses !include_dir_* on '${arg}', but '${norm}' is NOT in sync_paths. Files added there will be silently skipped on sync. Add '${norm}' to sync_paths to fix."
+            found_gaps=$((found_gaps + 1))
+        fi
+    done < <(grep -nE '!include_dir_(named|list|merge_named|merge_list)[[:space:]]+\S+' "${cfg}" 2>/dev/null || true)
+
+    if [ "${found_gaps}" -eq 0 ]; then
+        bashio::log.debug "audit: no sync_paths gaps detected in configuration.yaml"
+    else
+        bashio::log.warning "audit: ${found_gaps} sync_paths gap(s) detected — see WARNINGs above"
+    fi
+}
+
 # ── Git setup ─────────────────────────────────────────────────────
 
 # Configure git identity for export commits
@@ -115,6 +158,11 @@ fi
 # Build the path allowlist once at startup.
 build_sync_filter
 bashio::log.info "Sync paths: ${SYNC_PATHS[*]}"
+
+# Audit configuration.yaml against the freshly-built sync_paths
+# allowlist. Catches the 2026-05-25 incident class at add-on startup
+# instead of via post-hoc operator discovery. See function comment.
+audit_include_dir_directives
 
 # ================================================================
 #  EXPORT FUNCTIONS

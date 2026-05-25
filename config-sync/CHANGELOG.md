@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.1.7
+
+- **Feature**: At startup, scan `configuration.yaml` for `!include_dir_*`
+  directives targeting directories not in `sync_paths`, and emit a WARNING
+  for each gap. Catches the class of incident where a PR adds files under
+  a directory not in the allowlist — the add-on silently skips them, HA
+  references them, frontend assets break. See issue #3 (and the
+  [JLay2026/nanoclaw-zimaos#50](https://github.com/JLay2026/nanoclaw-zimaos/issues/50)
+  incident from 2026-05-25 for the motivating case).
+- New `audit_include_dir_directives()` helper using `grep` + `sed` +
+  the existing `path_allowed()` allowlist function. No new runtime
+  dependencies.
+
 ## 1.1.6
 
 - **Fix**: Log actual git push/fetch error messages instead of swallowing
