@@ -3,7 +3,7 @@
 # Source the bashio library (HA add-on option parsing + logging)
 source /usr/lib/bashio/bashio.sh
 # ---------------------------------------------------------------
-# Config Sync (GitOps) — HA Supervisor Add-on  v1.5.4
+# Config Sync (GitOps) — HA Supervisor Add-on  v1.6.0
 #
 # Bidirectional sync:
 #   IMPORT — pull config from GitHub → backup HA → validate → reload → verify
@@ -81,6 +81,37 @@ fi
 PRE_SYNC_BACKUP_RETENTION=$(bashio::config 'pre_sync_backup_retention')
 if [ -z "${PRE_SYNC_BACKUP_RETENTION}" ]; then
     PRE_SYNC_BACKUP_RETENTION=7
+fi
+
+# Allowlist of hostnames the github_repo URL is permitted to point at
+# (v1.6.0, Sprint 5 P1, M7). Default ["github.com"] catches the M7
+# review finding: without this, a misconfigured/social-engineered
+# github_repo URL would happily send the PAT to attacker.com.
+# Operators using GitHub Enterprise add their GHE hostname here
+# (e.g. ["github.com", "github.mycorp.io"]). Subdomain matches are
+# allowed via suffix-match (e.g. "github.com" allows api.github.com,
+# raw.githubusercontent.com, etc.). Build the array via the same
+# loop pattern as sync_paths.
+ALLOWED_REPO_HOSTS=()
+_i=0
+while bashio::config.exists "allowed_repo_hosts[${_i}]"; do
+    ALLOWED_REPO_HOSTS+=("$(bashio::config "allowed_repo_hosts[${_i}]")")
+    _i=$((_i + 1))
+done
+if [ "${#ALLOWED_REPO_HOSTS[@]}" -eq 0 ]; then
+    ALLOWED_REPO_HOSTS=("github.com")
+fi
+
+# Whether to abort the sync if the tracked repo contains symlinks
+# matching sync_paths (v1.6.0, Sprint 5 P1, M6). Default: true.
+# Symlinks in a tracked file are a path-traversal vector — a commit
+# could turn automations.yaml into a symlink targeting /etc/passwd
+# (read on cp) or another sensitive path (overwrite on cp). HA itself
+# also has trouble with symlinks in /config. Operators who legitimately
+# need symlinks (rare) can disable to revert to the v1.5.x behavior.
+BLOCK_SYMLINKS=$(bashio::config 'block_symlinks')
+if [ -z "${BLOCK_SYMLINKS}" ]; then
+    BLOCK_SYMLINKS="true"
 fi
 
 # Extra settle seconds added to POST_SYNC_SETTLE when we used /core/restart
@@ -508,9 +539,6 @@ status_mark_failure() {
 #     read them after the call returns.
 #   - Returns 0 on HTTP 2xx, 1 on non-2xx HTTP response (e.g. 401/403/404/500),
 #     2 on transport error (curl couldn't connect).
-#   - v1.5.4 (H1): hard-bounded by SUPERVISOR_API_TIMEOUT (default 30s)
-#     and SUPERVISOR_API_CONNECT_TIMEOUT (default 5s). Without these,
-#     a hung Supervisor would wedge the single-threaded sync loop.
 #
 # Callers that want a diagnostic log line on failure should call
 # log_supervisor_error after a non-zero return.
@@ -535,8 +563,7 @@ supervisor_api() {
 
     local code
     if ! code=$(curl "${args[@]}" 2>/dev/null); then
-        # Transport failure — couldn't reach Supervisor at all (or
-        # timed out per SUPERVISOR_API_TIMEOUT).
+        # Transport failure — couldn't reach Supervisor at all.
         echo "000" > "${SUPERVISOR_RESP_CODE_FILE}"
         return 2
     fi
@@ -567,8 +594,8 @@ log_supervisor_error() {
     body=$(head -c 500 "${SUPERVISOR_RESP_BODY_FILE}" 2>/dev/null | tr -d '\n' | tr -d '\r')
 
     if [ "${code}" = "000" ]; then
-        bashio::log.error "${prefix} (no response — Supervisor unreachable or timed out after ${SUPERVISOR_API_TIMEOUT}s)"
-        bashio::log.error "  Probable cause: add-on networking down, 'http://supervisor' DNS failure, or Supervisor hung"
+        bashio::log.error "${prefix} (no response — Supervisor unreachable)"
+        bashio::log.error "  Probable cause: add-on networking down, or 'http://supervisor' DNS failure"
     elif [ -n "${body}" ]; then
         bashio::log.error "${prefix} (HTTP ${code})"
         bashio::log.error "  Supervisor response: ${body}"
@@ -1015,7 +1042,141 @@ sync_touches_themes() {
     echo "${CHANGED}" | grep -qE '^themes/'
 }
 
+# ────────────────────────────────────────────────────────────────────
+#  Repo-host allowlist guard (v1.6.0, Sprint 5 P1, M7)
+# ────────────────────────────────────────────────────────────────────
+# Validates that github_repo points at a hostname in ALLOWED_REPO_HOSTS.
+# Defends against the case where the operator misconfigures (or is
+# socially engineered to set) github_repo to a non-GitHub URL — without
+# this guard, the add-on would happily embed the PAT in that URL and
+# send it on first clone or fetch.
+#
+# Subdomain matches are allowed via suffix-match: "github.com" in the
+# allowlist permits api.github.com, raw.githubusercontent.com, etc.
+# Operators on GitHub Enterprise add their GHE hostname to the list.
+#
+# Called once at startup. Exits the add-on with an error if the host
+# is not in the allowlist (a config error should be loud).
+check_repo_host_allowed() {
+    # Strip scheme and path with bash parameter expansion (no sed fork).
+    local repo_host="${REPO#*://}"
+    repo_host="${repo_host%%/*}"
+    # Also strip any embedded user@ in case PAT got included by mistake.
+    repo_host="${repo_host##*@}"
+
+    if [ -z "${repo_host}" ]; then
+        bashio::log.error "Unable to extract host from github_repo='${REPO}' — refusing to start"
+        exit 1
+    fi
+
+    local h
+    for h in "${ALLOWED_REPO_HOSTS[@]}"; do
+        if [[ "${repo_host}" == "${h}" ]] || [[ "${repo_host}" == *".${h}" ]]; then
+            bashio::log.info "github_repo host '${repo_host}' allowed (matches '${h}' in allowed_repo_hosts)"
+            return 0
+        fi
+    done
+
+    bashio::log.error "============================================================"
+    bashio::log.error "REFUSING TO START — github_repo host not in allowlist"
+    bashio::log.error "============================================================"
+    bashio::log.error "github_repo points at '${repo_host}', but allowed_repo_hosts is:"
+    local h_show
+    for h_show in "${ALLOWED_REPO_HOSTS[@]}"; do
+        bashio::log.error "  - ${h_show}"
+    done
+    bashio::log.error ""
+    bashio::log.error "This is a security guard added in v1.6.0. Without it, a"
+    bashio::log.error "misconfigured github_repo URL would send the GitHub PAT to"
+    bashio::log.error "an arbitrary host on first clone/fetch."
+    bashio::log.error ""
+    bashio::log.error "If '${repo_host}' is a host you trust (e.g. your GitHub"
+    bashio::log.error "Enterprise instance), add it to the allowed_repo_hosts"
+    bashio::log.error "config option in the add-on Configuration tab, save, and"
+    bashio::log.error "restart the add-on."
+    bashio::log.error "============================================================"
+    exit 1
+}
+
+# ────────────────────────────────────────────────────────────────────
+#  Tracked-symlink guard at sync time (v1.6.0, Sprint 5 P1, M6)
+# ────────────────────────────────────────────────────────────────────
+# Aborts the sync if any file tracked in the repo AND matching
+# sync_paths is a symlink (relative to REPO_DIR). Defends against the
+# case where a commit replaces automations.yaml with a symlink to
+# /etc/passwd or /data/sync_status.json — without this guard, the
+# subsequent cp would either read sensitive files (low impact since
+# the add-on is already container-elevated) or overwrite them with
+# arbitrary content from the commit.
+#
+# Only checks files inside sync_paths; non-synced tracked files can be
+# anything (we're not going to copy them).
+#
+# Returns 0 if no blocking symlinks, 1 if any should abort this sync.
+# Honors BLOCK_SYMLINKS config: when "false", same diagnostic ERROR
+# but returns 0 (warning-only, v1.5.x behavior).
+check_no_tracked_symlinks() {
+    local symlinks=()
+    while IFS= read -r f; do
+        [ -z "${f}" ] && continue
+        if ! path_allowed "${f}"; then
+            continue
+        fi
+        if [ -L "${REPO_DIR}/${f}" ]; then
+            symlinks+=("${f}")
+        fi
+    done < <(cd "${REPO_DIR}" && git ls-files 2>/dev/null)
+
+    if [ "${#symlinks[@]}" -eq 0 ]; then
+        return 0
+    fi
+
+    bashio::log.error "============================================================"
+    if [ "${BLOCK_SYMLINKS}" = "true" ]; then
+        bashio::log.error "SYNC ABORTED — tracked symlinks detected in sync_paths"
+    else
+        bashio::log.error "TRACKED SYMLINKS DETECTED (block_symlinks=false — continuing)"
+    fi
+    bashio::log.error "============================================================"
+    bashio::log.error "The following tracked files are symlinks in ${REPO_DIR}:"
+    local s
+    local count=0
+    for s in "${symlinks[@]}"; do
+        local target
+        target=$(readlink "${REPO_DIR}/${s}" 2>/dev/null || echo "(unreadable)")
+        bashio::log.error "  - ${s} -> ${target}"
+        count=$((count + 1))
+        if [ "${count}" -ge 10 ]; then
+            if [ "${#symlinks[@]}" -gt 10 ]; then
+                bashio::log.error "  ... (${#symlinks[@]} total, list truncated)"
+            fi
+            break
+        fi
+    done
+    bashio::log.error ""
+    bashio::log.error "Symlinks in tracked config files are a path-traversal vector."
+    bashio::log.error "On sync, cp would follow the symlink and either read the"
+    bashio::log.error "target (information disclosure) or overwrite it with commit"
+    bashio::log.error "content (integrity attack). HA itself also has trouble with"
+    bashio::log.error "symlinks in /config — they're usually accidents, not intent."
+    bashio::log.error ""
+    bashio::log.error "Fix: replace the symlinks with regular files in your repo,"
+    bashio::log.error "or set block_symlinks=false in the add-on config if you"
+    bashio::log.error "intentionally use symlinks and accept the risk."
+    bashio::log.error "============================================================"
+
+    if [ "${BLOCK_SYMLINKS}" = "true" ]; then
+        return 1
+    fi
+    return 0
+}
+
 # ── Git setup ─────────────────────────────────────────────────────
+
+# Validate github_repo host before any clone/fetch (v1.6.0, M7).
+# Exits the add-on on failure — a misconfigured repo URL is a fatal
+# startup error, not a recoverable runtime issue.
+check_repo_host_allowed
 
 # Configure git identity for export commits
 git config --global user.name "HA Config Sync"
@@ -1319,6 +1480,25 @@ do_import() {
         sync_log_close failure
         # Roll back git state so the next cycle retries the same SHA
         # once the operator has added the missing directories to sync_paths.
+        git reset --hard "${LOCAL}"
+        return 1
+    fi
+
+    # ── tracked-symlink guard (v1.6.0, Sprint 5 P1, M6) ──────────────
+    # Abort BEFORE backup/copy if the incoming repo state contains
+    # symlinks in any sync_paths file. cp would otherwise follow them
+    # and potentially read or overwrite sensitive paths via the synced
+    # /config location. Honors block_symlinks config option; when false,
+    # logs the ERROR but allows the sync to continue (v1.5.x behavior).
+    if ! check_no_tracked_symlinks; then
+        sync_log ERROR "event=tracked_symlinks result=abort"
+        notify_sync_failure \
+            "Config Sync: tracked symlinks blocking sync" \
+            "The repo contains symlinks in tracked sync_paths files (path-traversal vector). Sync aborted to prevent cp from following them. See add-on log for the list of symlinks. Fix by replacing with regular files in the repo, or set block_symlinks=false in the add-on config if intentional."
+        status_mark_failure "${REMOTE}" "tracked_symlinks" \
+            "Tracked files in sync_paths are symlinks; aborted to prevent path traversal via cp. See add-on log for the list and fix recipe." \
+            ""
+        sync_log_close failure
         git reset --hard "${LOCAL}"
         return 1
     fi
