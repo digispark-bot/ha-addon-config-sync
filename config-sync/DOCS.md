@@ -46,6 +46,9 @@ When `export_enabled` is true:
    the add-on commits and pushes them to `export_branch`.
 4. Immediately after an import, the next export cycle is skipped to
    avoid re-committing what was just pulled.
+5. **Each export cycle with real changes writes a per-export structured
+   log (v1.5.3+)** under `/data/logs/export/` so operators can
+   reconstruct any past push.
 
 ## Configuration
 
@@ -230,7 +233,7 @@ name for manual backups you want to keep.
 
 ## Observability
 
-The add-on surfaces sync state in four places, ordered from most operator-
+The add-on surfaces sync state in five places, ordered from most operator-
 friendly to most diagnostic-detailed.
 
 ### sensor.config_sync_status (v1.5.0+)
@@ -342,6 +345,54 @@ file is also exposed as the `last_log_file` attribute on
 If `mkdir` on the log directory fails (e.g. disk full), the cycle logs a
 WARNING to the rolling add-on log and continues — per-sync logging is
 best-effort and never blocks a sync.
+
+### Per-export structured log (v1.5.3+)
+
+Export-side parity with the per-sync log. Every `do_export()` cycle that
+has real changes to push writes a dedicated file under `/data/logs/export/`
+named `<UTC-timestamp>-export-<mode>.log` where `<mode>` is `initial` or
+`auto`. No-op export cycles (no HA-side drift) produce no log file. Same
+20-file retention as the sync side; separate subdir so the two streams
+don't intermix.
+
+Event vocabulary (one per line):
+
+```
+2026-05-26T03:30:00Z [INFO] event=export_start mode=auto branch=main
+2026-05-26T03:30:01Z [INFO] event=files_staged count=2 paths=automations.yaml,scripts.yaml
+2026-05-26T03:30:01Z [INFO] event=commit sha=abc12345 files=2
+2026-05-26T03:30:03Z [INFO] event=push branch=main result=success
+2026-05-26T03:30:03Z [INFO] event=export_end result=success
+```
+
+Failure-path examples:
+
+```
+2026-05-26T03:35:00Z [INFO] event=export_start mode=auto branch=main
+2026-05-26T03:35:01Z [INFO] event=files_staged count=1 paths=automations.yaml
+2026-05-26T03:35:01Z [INFO] event=commit sha=def67890 files=1
+2026-05-26T03:35:02Z [ERROR] event=push branch=main result=failed error="remote: Permission denied to ..."
+2026-05-26T03:35:02Z [INFO] event=export_end result=push_failed
+```
+
+```
+2026-05-26T03:40:00Z [INFO] event=export_start mode=initial branch=main
+2026-05-26T03:40:01Z [INFO] event=files_staged count=3 paths=automations.yaml,scripts.yaml,scenes.yaml
+2026-05-26T03:40:01Z [INFO] event=commit sha=xyz98765 files=3
+2026-05-26T03:40:01Z [WARN] event=push branch=main result=skipped reason=no_pat
+2026-05-26T03:40:01Z [INFO] event=export_end result=no_pat
+```
+
+Operator access:
+
+```
+docker exec -it addon_<slug>_config-sync ls -lt /data/logs/export/
+docker exec -it addon_<slug>_config-sync cat /data/logs/export/<filename>.log
+```
+
+Push error text is run through `sanitize_output()` first — any embedded
+GitHub PAT is scrubbed before being written to the log. The error string
+is also truncated to 200 characters to keep each line bounded.
 
 ### Import logs (happy path)
 
