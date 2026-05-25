@@ -187,23 +187,57 @@ they limit blast radius if exfiltrated.
 The PAT you paste into the add-on UI is stored encrypted at rest by
 the Home Assistant Supervisor.
 
-**However, at runtime, the add-on writes the PAT to
-`/data/repo/.git/config` on disk inside the add-on container**, as
-part of the HTTPS remote URL. This is how git authenticates without
-a credential helper. The `/data/` path is persistent across container
-restart.
+As of **v1.6.1**, at runtime the add-on:
+
+1. Reads the PAT into the `GH_CONFIG_SYNC_PAT` env var of the
+   `run.sh` process (exported into the environment so git
+   subprocesses inherit it).
+2. Configures git with an inline credential helper:
+   ```
+   credential.helper = !f() { echo username=x-access-token; echo "password=${GH_CONFIG_SYNC_PAT}"; }; f
+   ```
+   The string `${GH_CONFIG_SYNC_PAT}` is what `.git/config` actually
+   contains as a literal — bash expands it at git-command time, not
+   at config-write time. The PAT itself is **never written to disk**.
+3. Uses `git -c credential.helper=...` inline for the initial clone
+   so the very first authentication needs no on-disk credential.
+4. On every startup, runs `git remote set-url origin "${REPO}"` to
+   ensure the remote URL is the plain HTTPS form. This idempotently
+   cleans any PAT-embedded URL left over from v1.5.x or v1.6.0 on
+   first v1.6.1 startup.
+
+**Where the PAT is reachable at runtime:**
+- `/proc/<pid>/environ` of the running `run.sh` process and its git
+  subprocesses — visible to root in the add-on container while the
+  add-on is running. Gone the moment the add-on stops.
+- HA's encrypted Supervisor-level options store (at rest, expected).
+
+**Where the PAT is NOT reachable:**
+- `/data/repo/.git/config` — only the literal helper string lives
+  there, never the resolved PAT value.
+- `git remote -v` output — shows the plain HTTPS URL.
+- The rolling add-on log — `sanitize_output()` (v1.1.6+, hardened in
+  v1.5.4) strips the PAT from any captured stderr.
+- The per-sync log files under `/data/logs/sync/` and
+  `/data/logs/export/` — also routed through `sanitize_output()`.
 
 Anyone with `docker exec` access to the add-on container (HAOS admin
-+ host access) can read the PAT in plaintext from that file. The PAT
-is also scrubbed from log output by `sanitize_output()` (v1.1.6+,
-hardened in v1.5.4) so it doesn't leak into the rolling add-on log.
++ host access) can still read the PAT via `/proc/<pid>/environ`
+while the add-on is running. The threat model improvement in v1.6.1
+is that the PAT no longer sits on the persistent `/data/` volume
+between container restarts — an attacker would need to compromise
+the add-on while it's running, not just exfiltrate `/data/` from a
+stopped container or a backup.
 
 **Recommendation**: use a fine-grained PAT scoped to your single
 GitHub repo with Contents: read+write only. That way exfiltration
-limits attacker to push access on one repo.
+limits the attacker to push access on one repo.
 
-A future release may add an optional git credential helper to keep
-the PAT out of `.git/config` entirely. Not yet implemented.
+**Upgrading from v1.5.x or v1.6.0**: no operator action needed. On
+first start of v1.6.1, the `git remote set-url` and
+`git config credential.helper` calls overwrite the prior
+PAT-embedded URL automatically. After the first sync, `.git/config`
+is clean.
 
 ## Workflows
 
@@ -249,9 +283,10 @@ directions are handled. Import takes priority.
 - **Post-sync verification probes** (v1.2.0+) for behavioral verification
   that check_config doesn't catch.
 - **PAT scrubbing in logs** (v1.1.6+, hardened in v1.5.4).
-- **GitHub PAT stored encrypted at rest** by HA's options store; written
-  to `.git/config` in plaintext at runtime (see "Where the PAT lives"
-  above).
+- **PAT not written to disk** (v1.6.1+): credential helper reads PAT
+  from process env var at git-command time. Prior versions stored the
+  PAT in `/data/repo/.git/config`.
+- **GitHub PAT stored encrypted at rest** by HA's options store.
 - **Export commits** attributed to `HA Config Sync
   <config-sync@homeassistant.local>` for audit trail.
 

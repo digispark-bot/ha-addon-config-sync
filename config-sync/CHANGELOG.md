@@ -1,5 +1,55 @@
 # Changelog
 
+## 1.6.1
+
+Sprint 5 P2 from the 2026-05-25 code-and-security review — closes the
+M3 finding (PAT written to `.git/config` on disk inside the persistent
+`/data/` volume). PAT is now passed to git via an inline credential
+helper that reads from a process env var at git-command time, so the
+PAT never lands on disk.
+
+- **Fix (Review M3)**: PAT no longer written to `.git/config`. New
+  pattern:
+  1. Top of `run.sh` exports `GH_CONFIG_SYNC_PAT="${PAT}"` into the
+     process environment along with `GIT_TERMINAL_PROMPT=0`.
+  2. A credential helper is configured as an inline shell function:
+     `!f() { echo username=x-access-token; echo "password=${GH_CONFIG_SYNC_PAT}"; }; f`
+     The literal string `${GH_CONFIG_SYNC_PAT}` is what `git config`
+     stores in `.git/config` — bash expands it at git-command time,
+     not at config-write time. The PAT itself is never written to
+     disk.
+  3. The initial clone uses `git -c credential.helper=...` inline so
+     the very first authentication needs no on-disk credential.
+  4. After clone (or on every startup for existing repos),
+     `git remote set-url origin "${REPO}"` is run to ensure the
+     remote URL is the plain HTTPS form with NO PAT embedded. This
+     idempotently cleans any PAT-in-URL config left from v1.5.x or
+     v1.6.0 on first v1.6.1 startup.
+
+- **Upgrade behavior**: existing v1.5.x / v1.6.0 deployments with
+  PATs already in `.git/config` get cleaned on first start of v1.6.1
+  — the `remote set-url origin "${REPO}"` and `git config
+  credential.helper ...` calls overwrite the prior PAT-embedded URL
+  and (for set-url) write a clean URL back. No operator action
+  required.
+
+- **Threat model improvement**: prior versions left the PAT in
+  `/data/repo/.git/config` (persistent across container restart) and
+  in `git remote -v` output (live, only when add-on is running, but
+  still visible to anyone with `docker exec`). v1.6.1 leaves the PAT
+  only in `/proc/<pid>/environ` of the running `run.sh` process and
+  its `git` subprocesses — ephemeral, gone on add-on stop.
+
+- **No new options**; no schema changes; no permission changes; no
+  behavior change in the happy path. The credential helper pattern
+  is functionally equivalent to URL-embedded credentials from git's
+  authentication-protocol perspective.
+
+- **No new config option for `GH_CONFIG_SYNC_PAT`** — the env-var
+  name is an internal implementation detail, not an operator-tunable.
+  Operators continue to set `github_pat` in the add-on UI exactly as
+  before.
+
 ## 1.6.0
 
 Sprint 5 P1 from the 2026-05-25 code-and-security review. Two

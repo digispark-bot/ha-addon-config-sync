@@ -3,7 +3,7 @@ description: >-
   Bidirectional GitOps for Home Assistant — pulls config from GitHub,
   validates and reloads; exports HA-side changes back to GitHub.
   Zero SSH, fully GUI-managed.
-version: "1.6.0"
+version: "1.6.1"
 slug: "config-sync"
 url: "https://github.com/JLay2026/ha-addon-config-sync"
 startup: application
