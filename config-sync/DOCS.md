@@ -12,9 +12,16 @@ back to GitHub automatically.
 2. Every `check_interval` seconds it runs `git fetch` to check for new commits.
 3. When new commits are found, it identifies which files changed.
 4. Only files matching your `sync_paths` allowlist are copied to `/config`.
-5. HA’s config checker validates the result via the Supervisor API.
-6. If valid, HA reloads automatically. If invalid, the files are rolled
-   back to their previous state and the error is logged.
+5. **A pre-sync HA backup is triggered** (named `gitops-pre-<short_sha>`)
+   covering the `homeassistant` folder. If the backup API fails, the sync
+   aborts and rolls back the local git state so the next cycle retries.
+6. HA's config checker validates the result via the Supervisor API.
+7. If valid, HA reloads automatically.
+8. **Post-sync verification probes** check that HA's state machine and REST
+   API are responsive after the reload. Either probe failing triggers
+   file-level rollback + best-effort re-reload, and the operator is pointed
+   at the named pre-sync backup for storage-level restore.
+9. If invalid at any step, the files are rolled back and the error is logged.
 
 ### Export (HA → GitHub)
 
@@ -41,6 +48,7 @@ When `export_enabled` is true:
 | `check_interval` | No | `300` | Seconds between import checks (60–3600) |
 | `sync_paths` | No | See below | List of file/directory paths to sync |
 | `github_pat` | No | — | GitHub PAT — required for private repos and export (see below) |
+| `post_sync_settle_seconds` | No | `5` | Seconds to wait after `reload_all` before running verification probes. Bump for slow HA setups; 0 disables the settle delay. Range: 0–60. |
 
 ### Export options
 
@@ -68,6 +76,16 @@ Default paths:
 - `packages/`
 - `dashboards/`
 
+**⚠️ sync_paths gotcha:** if `configuration.yaml` contains a `!include_dir_*`
+directive pointing at a directory not in this list (e.g., `themes/`,
+`lovelace/`, `blueprints/`), files under that directory are silently
+skipped during sync. Add the directory to `sync_paths` and restart the
+add-on before merging PRs that add files under it.
+
+Since v1.1.7 the add-on detects this class of misconfiguration at startup
+and emits a WARNING per gap in the log; the warning includes the line
+number and a one-line remediation hint.
+
 ### GitHub Personal Access Token
 
 A GitHub PAT is required for private repos (import) and for export (push).
@@ -93,7 +111,7 @@ Fine-grained is preferred because it limits access to a single repository
 with only the permissions the add-on actually uses (`git clone` and
 `git push`). Classic PATs grant broader access across all repositories.
 
-The token is stored in HA’s encrypted add-on option store and is never
+The token is stored in HA's encrypted add-on option store and is never
 written to disk inside the container.
 
 ## Workflows
@@ -129,12 +147,23 @@ To populate an empty repo with your current HA config:
 
 ## Security
 
+### Permissions the add-on requests
+
+| Permission | Why | Since |
+|------------|-----|-------|
+| `homeassistant_api: true` | Core API access for `check_config`, `reload_all`, and the post-sync verification probes (`/core/api/states/*`, `/core/api/`) | 1.1.4 |
+| `hassio_api: true` + `hassio_role: backup` | Supervisor API access for the pre-sync HA backup (`POST /backups/new/partial`). `backup` is the least-privilege role that grants the backups API; `manager` would also work but is broader than necessary. | 1.2.1 |
+| `map: config:rw` | Direct read/write to `/config` for the sync. | 1.0.0 |
+
+### General security posture
+
 - **No manual HA tokens.** The add-on uses the auto-injected `$SUPERVISOR_TOKEN`
   for HA API calls.
-- **No Samba.** Direct `/config` access via the Supervisor’s `map: config:rw`.
+- **No Samba.** Direct `/config` access via the Supervisor's `map: config:rw`.
 - **No inbound ports.** Only outbound HTTPS to GitHub.
-- **Rollback on failure.** Invalid imports are automatically reverted.
-- **GitHub PAT** is stored in HA’s encrypted add-on option store.
+- **Rollback on failure.** Invalid imports are automatically reverted. Storage-level
+  rollback available via the `gitops-pre-<sha>` HA backup taken before each sync.
+- **GitHub PAT** is stored in HA's encrypted add-on option store.
   Fine-grained tokens scoped to a single repo with Contents read/write
   are recommended over classic tokens with broad `repo` scope.
 - **Export commits** are attributed to `HA Config Sync <config-sync@homeassistant.local>`
@@ -144,13 +173,15 @@ To populate an empty repo with your current HA config:
 
 Check the **Log** tab in the add-on panel.
 
-### Import logs
+### Import logs (happy path)
 
 ```
 [config-sync] Import: change detected (abc12345 -> def67890)
 [config-sync] Import: syncing configuration.yaml automations.yaml
+[config-sync] Pre-sync HA backup 'gitops-pre-def67890' triggered — Settings → System → Backups
 [config-sync] Import: config valid — reloading Home Assistant
 [config-sync] Import: reload complete (abc12345 -> def67890)
+[config-sync] Post-sync verify: both probes passed — sync verified healthy
 ```
 
 ### Export logs
@@ -165,11 +196,40 @@ Check the **Log** tab in the add-on panel.
 
 ### Error logs
 
+Failed Supervisor API calls log the actual HTTP status code and a
+truncated response body so the root cause is visible without a separate
+diagnostic step. Examples:
+
+```
+[config-sync] Pre-sync HA backup API failed — REFUSING to sync (HTTP 403)
+[config-sync]   Supervisor response: {"result":"error","message":"You don't have the role to call this endpoint"}
+[config-sync]   Common causes for this endpoint:
+[config-sync]     HTTP 401/403 — add-on missing 'hassio_api: true' or 'hassio_role: backup' in config.yaml
+[config-sync]     HTTP 4xx     — backup integration not loaded, or request body schema changed
+[config-sync]     HTTP 5xx     — Supervisor internal error, or disk full
+[config-sync] Aborting sync — rolling back git state to abc12345; next cycle will retry
+```
+
 ```
 [config-sync] Import: config invalid: Integration 'nonexistent' not found
 [config-sync] Import: rolling back to abc12345
+```
+
+```
+[config-sync] Post-sync probe 2 FAILED: /core/api/ unresponsive or auth rejected (HTTP 500)
+[config-sync]   Supervisor response: {"error":"Internal Server Error"}
+[config-sync] POST-SYNC VERIFICATION FAILED — rolling back
+[config-sync] If HA is still broken, restore the pre-sync backup:
+[config-sync]   Settings → System → Backups → 'gitops-pre-def67890'
+```
+
+```
 [config-sync] Export: no github_pat configured — cannot push (read-only)
 ```
+
+If a sync fails with a Supervisor response you don't understand, the
+HTTP code + response body in the log line are enough to file an issue
+with full diagnostic context.
 
 ## Agent integration
 
@@ -184,5 +244,5 @@ Any agent or automation platform that can call the HA REST API can:
 To trigger an on-demand export, an agent can restart the add-on — the
 initial export runs on every startup when `export_enabled` is true.
 
-This makes it compatible with NanoClaw’s `agent-homeops`, Home Assistant
+This makes it compatible with NanoClaw's `agent-homeops`, Home Assistant
 automations, or any future agent platform.
