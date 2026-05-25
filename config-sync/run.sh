@@ -3,7 +3,7 @@
 # Source the bashio library (HA add-on option parsing + logging)
 source /usr/lib/bashio/bashio.sh
 # ---------------------------------------------------------------
-# Config Sync (GitOps) — HA Supervisor Add-on  v1.3.0
+# Config Sync (GitOps) — HA Supervisor Add-on  v1.3.1
 #
 # Bidirectional sync:
 #   IMPORT — pull config from GitHub → backup HA → validate → reload → verify
@@ -36,6 +36,14 @@ if [ -z "${POST_SYNC_SETTLE}" ]; then
     POST_SYNC_SETTLE=5
 fi
 
+# Whether to surface sync failures as HA persistent_notifications.
+# Default: true. Operator can disable for headless deployments where
+# UI clutter is unwanted.
+NOTIFY_ON_FAILURE=$(bashio::config 'notify_on_failure')
+if [ -z "${NOTIFY_ON_FAILURE}" ]; then
+    NOTIFY_ON_FAILURE="true"
+fi
+
 # ── Constants ──────────────────────────────────────────────────────
 REPO_DIR="/data/repo"
 CONFIG_DIR="/config"
@@ -49,6 +57,12 @@ LAST_EXPORT_TS="/data/.last-export-ts"
 # runs as a single-threaded bash loop so there's no concurrent-write risk.
 SUPERVISOR_RESP_BODY_FILE="/tmp/.sup_resp_body"
 SUPERVISOR_RESP_CODE_FILE="/tmp/.sup_resp_code"
+
+# Persistent-notification ID used by notify_sync_failure / _recovered.
+# Singleton — every failure updates the same notification, every recovery
+# dismisses it. Operators see one notification reflecting the LATEST sync
+# state, not a backlog.
+NOTIFICATION_ID="config_sync_failure"
 
 # Default export branch to the sync branch if not set
 if [ -z "${EXPORT_BRANCH}" ]; then
@@ -167,6 +181,59 @@ log_supervisor_error() {
     else
         bashio::log.error "${prefix} (HTTP ${code}, empty body)"
     fi
+}
+
+# Create or update an HA persistent_notification announcing a sync failure.
+# Singleton (NOTIFICATION_ID) — every failure overwrites the previous one
+# so the UI shows the LATEST state. Operators dismiss it implicitly via
+# notify_sync_recovered() on the next healthy sync.
+#
+#   $1 = title (short — shown in the UI header)
+#   $2 = message (longer — shown in the body; markdown supported by HA)
+#
+# Failures of the notification API itself are logged at WARNING and do
+# not cascade — the sync's existing failure-handling has already done
+# its job before this is called.
+#
+# No-op if notify_on_failure config option is false.
+notify_sync_failure() {
+    if [ "${NOTIFY_ON_FAILURE}" != "true" ]; then
+        return 0
+    fi
+    local title="$1" message="$2"
+    # Use jq to safely build the JSON — handles any quoting, newlines,
+    # backslashes, etc. that might appear in error messages.
+    local body
+    body=$(jq -nc \
+        --arg id "${NOTIFICATION_ID}" \
+        --arg title "${title}" \
+        --arg msg "${message}" \
+        '{notification_id: $id, title: $title, message: $msg}' 2>/dev/null)
+    if [ -z "${body}" ]; then
+        bashio::log.warning "notify_sync_failure: failed to build JSON body (jq error)"
+        return 0
+    fi
+    if ! supervisor_api POST "/core/api/services/persistent_notification/create" "${body}" > /dev/null; then
+        bashio::log.warning "notify_sync_failure: HA notification API call failed (sync error already logged above)"
+    fi
+    return 0
+}
+
+# Dismiss the sync-failure persistent_notification (called on healthy sync
+# completion). Idempotent — succeeds whether or not a notification exists.
+# No-op if notify_on_failure config option is false.
+notify_sync_recovered() {
+    if [ "${NOTIFY_ON_FAILURE}" != "true" ]; then
+        return 0
+    fi
+    local body
+    body=$(jq -nc --arg id "${NOTIFICATION_ID}" '{notification_id: $id}' 2>/dev/null)
+    if [ -z "${body}" ]; then
+        return 0
+    fi
+    # Dismiss failure silently — we don't care if it didn't exist.
+    supervisor_api POST "/core/api/services/persistent_notification/dismiss" "${body}" > /dev/null 2>&1 || true
+    return 0
 }
 
 # Audit configuration.yaml for !include_dir_* directives whose target
@@ -591,6 +658,9 @@ do_import() {
     if ! ha_backup_pre_sync "${REMOTE}"; then
         bashio::log.error "Aborting sync — rolling back git state to ${LOCAL:0:8}; next cycle will retry"
         git reset --hard "${LOCAL}"
+        notify_sync_failure \
+            "Config Sync: pre-sync backup failed" \
+            "The add-on could not take an HA backup before syncing ${REMOTE:0:8}. Sync aborted and will retry next cycle. Check the add-on log for the Supervisor error response."
         return 1
     fi
 
@@ -639,6 +709,9 @@ do_import() {
         done <<< "${CHANGED}"
         git reset --hard "${LOCAL}"
         rm -rf "${BACKUP}"
+        notify_sync_failure \
+            "Config Sync: check_config API unreachable" \
+            "Tried to validate ${REMOTE:0:8} but the Supervisor check_config endpoint did not respond. Sync rolled back to ${LOCAL:0:8}. Check the add-on log for the Supervisor error response."
         return 1
     }
 
@@ -689,12 +762,18 @@ do_import() {
             bashio::log.error "============================================================"
 
             rm -rf "${BACKUP}"
+            notify_sync_failure \
+                "Config Sync: post-sync verification failed" \
+                "Reloaded ${REMOTE:0:8} but HA failed health probes afterward. Files rolled back to ${LOCAL:0:8}. **If HA is still broken, restore backup \`gitops-pre-${REMOTE:0:8}\`** via Settings → System → Backups. Check the add-on log for the failed probe details."
             return 1
         fi
 
         rm -rf "${BACKUP}"
         # Mark that we just imported — export should skip next cycle
         git rev-parse HEAD > "${LAST_IMPORT_MARKER}"
+        # Healthy sync completed — dismiss any prior failure notification
+        # so the operator's UI is clean.
+        notify_sync_recovered
     else
         ERROR_MSG=$(echo "${CHECK_RESULT}" | jq -r '.errors // .message // "unknown error"' 2>/dev/null)
         bashio::log.error "Import: config invalid: ${ERROR_MSG}"
@@ -705,6 +784,9 @@ do_import() {
         done <<< "${CHANGED}"
         git reset --hard "${LOCAL}"
         rm -rf "${BACKUP}"
+        notify_sync_failure \
+            "Config Sync: check_config rejected the new config" \
+            "HA's check_config returned invalid for ${REMOTE:0:8}: ${ERROR_MSG}. Files rolled back to ${LOCAL:0:8}; sync will keep retrying. Fix the config in the repo and push again."
     fi
 
     # Clean old rollback dirs (keep last 5)
