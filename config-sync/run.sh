@@ -3,7 +3,7 @@
 # Source the bashio library (HA add-on option parsing + logging)
 source /usr/lib/bashio/bashio.sh
 # ---------------------------------------------------------------
-# Config Sync (GitOps) — HA Supervisor Add-on  v1.6.1
+# Config Sync (GitOps) — HA Supervisor Add-on  v1.6.2
 #
 # Bidirectional sync:
 #   IMPORT — pull config from GitHub → backup HA → validate → reload → verify
@@ -93,6 +93,18 @@ if [ -z "${PRE_SYNC_BACKUP_RETENTION}" ]; then
     PRE_SYNC_BACKUP_RETENTION=7
 fi
 
+# Prefix for the pre-sync HA backup names (v1.6.2, Review L18).
+# Default keeps backward compat with v1.5.2+. Operators who make
+# their own manual gitops-pre-* backups (or who want a clearer
+# namespace separation between human and add-on backups) can
+# override. Whatever prefix is set is what prune_pre_sync_backups
+# matches on — change it and old auto-backups will look like
+# operator backups and be left alone forever.
+PRE_SYNC_BACKUP_PREFIX=$(bashio::config 'pre_sync_backup_name_prefix')
+if [ -z "${PRE_SYNC_BACKUP_PREFIX}" ]; then
+    PRE_SYNC_BACKUP_PREFIX="gitops-pre-"
+fi
+
 # Allowlist of hostnames the github_repo URL is permitted to point at
 # (v1.6.0, Sprint 5 P1, M7). Default ["github.com"] catches the M7
 # review finding: without this, a misconfigured/social-engineered
@@ -139,8 +151,15 @@ LAST_EXPORT_TS="/data/.last-export-ts"
 # These survive the subshell boundary used by `var=$(supervisor_api ...)`,
 # so the parent shell can read them after the call returns. The add-on
 # runs as a single-threaded bash loop so there's no concurrent-write risk.
-SUPERVISOR_RESP_BODY_FILE="/tmp/.sup_resp_body"
-SUPERVISOR_RESP_CODE_FILE="/tmp/.sup_resp_code"
+# v1.6.2 (Review L16): mktemp instead of fixed paths in /tmp.
+# Today's single-threaded loop wouldn't race, but a future feature
+# (background export, parallel agent calls) would. Unique per-PID
+# paths future-proof this without behavior change. Trap on EXIT
+# cleans up — the add-on's infinite loop means EXIT only fires on
+# explicit stop / SIGTERM, but the trap is essentially free.
+SUPERVISOR_RESP_BODY_FILE=$(mktemp /tmp/.sup_resp_body.XXXXXX)
+SUPERVISOR_RESP_CODE_FILE=$(mktemp /tmp/.sup_resp_code.XXXXXX)
+trap 'rm -f "${SUPERVISOR_RESP_BODY_FILE}" "${SUPERVISOR_RESP_CODE_FILE}"' EXIT
 
 # Supervisor API timeouts (v1.5.4, H1). Without these, a hung
 # Supervisor would wedge the single-threaded sync loop forever.
@@ -854,7 +873,7 @@ check_sync_paths_gap() {
 # See: GitHub issue #4, and the JLay2026/nanoclaw-zimaos#50 incident.
 ha_backup_pre_sync() {
     local target_sha="$1"
-    local name="gitops-pre-${target_sha:0:8}"
+    local name="${PRE_SYNC_BACKUP_PREFIX}${target_sha:0:8}"
     local body
     # JSON body. addons=[] folders=["homeassistant"] compressed=true
     body=$(printf '{"name":"%s","addons":[],"folders":["homeassistant"],"compressed":true}' "${name}")
@@ -893,13 +912,34 @@ prune_pre_sync_backups() {
         return 0
     fi
 
-    # Filter to gitops-pre-* by name, sort by date descending, drop the
-    # first N (the keep set), emit slugs of the rest. jq's .[$keep:]
-    # slice on an empty / nil list yields empty output safely.
+    # v1.6.2 (Review L19): defensive drift detection. If the response
+    # shape ever changes (e.g. HA renames .data.backups to .backups
+    # in a future major version), the .[].name select below will
+    # silently no-op and the operator will never know retention
+    # stopped working. Compare the raw .data.backups length against
+    # lifetime sync_count; if we've taken many syncs but the list is
+    # empty, log INFO to surface the drift. False-positive case is
+    # a brand-new install (sync_count low) — the threshold filters
+    # that out.
+    local raw_total counters sc
+    raw_total=$(echo "${list_json}" | jq -r '(.data.backups // []) | length' 2>/dev/null)
+    if [ "${raw_total:-0}" -eq 0 ]; then
+        counters=$(status_load_counters)
+        sc=$(echo "${counters}" | awk '{print $1}')
+        if [ "${sc:-0}" -ge 5 ]; then
+            bashio::log.info "prune_pre_sync_backups: Supervisor returned no backups but lifetime sync_count=${sc}. Possible HA API drift (e.g. .data.backups renamed); confirm 'GET /backups' response shape if backups are accumulating on disk."
+        fi
+    fi
+
+    # Filter to ${PRE_SYNC_BACKUP_PREFIX}* by name, sort by date
+    # descending, drop the first N (the keep set), emit slugs of the
+    # rest. jq's .[$keep:] slice on an empty / nil list yields empty
+    # output safely. v1.6.2 (Review L18): prefix is now configurable.
     local doomed_slugs
     doomed_slugs=$(echo "${list_json}" | jq -r \
         --argjson keep "${PRE_SYNC_BACKUP_RETENTION}" \
-        '(.data.backups // []) | map(select(.name | startswith("gitops-pre-"))) | sort_by(.date) | reverse | .[$keep:] | .[] | .slug' \
+        --arg prefix "${PRE_SYNC_BACKUP_PREFIX}" \
+        '(.data.backups // []) | map(select(.name | startswith($prefix))) | sort_by(.date) | reverse | .[$keep:] | .[] | .slug' \
         2>/dev/null)
 
     if [ -z "${doomed_slugs}" ]; then
@@ -1007,7 +1047,7 @@ reconcile_tracked_files() {
             cp_failure_count=$((cp_failure_count + 1))
             continue
         fi
-        if cp "${REPO_DIR}/${f}" "${CONFIG_DIR}/${f}" 2>/dev/null; then
+        if cp -p "${REPO_DIR}/${f}" "${CONFIG_DIR}/${f}" 2>/dev/null; then
             bashio::log.info "Reconcile: copied tracked-but-missing file '${f}' to /config (issue #2 prevention)"
             reconcile_count=$((reconcile_count + 1))
         else
@@ -1284,7 +1324,7 @@ stage_config_to_repo() {
                     rel="${src#"${CONFIG_DIR}"/}"
                     mkdir -p "${REPO_DIR}/$(dirname "${rel}")"
                     if ! cmp -s "${src}" "${REPO_DIR}/${rel}" 2>/dev/null; then
-                        cp "${src}" "${REPO_DIR}/${rel}"
+                        cp -p "${src}" "${REPO_DIR}/${rel}"
                         changed=1
                     fi
                 done < <(find "${CONFIG_DIR}/${pattern}" -type f \( -name '*.yaml' -o -name '*.yml' \) 2>/dev/null)
@@ -1294,7 +1334,7 @@ stage_config_to_repo() {
             if [ -f "${CONFIG_DIR}/${pattern}" ]; then
                 if ! cmp -s "${CONFIG_DIR}/${pattern}" "${REPO_DIR}/${pattern}" 2>/dev/null; then
                     mkdir -p "${REPO_DIR}/$(dirname "${pattern}")"
-                    cp "${CONFIG_DIR}/${pattern}" "${REPO_DIR}/${pattern}"
+                    cp -p "${CONFIG_DIR}/${pattern}" "${REPO_DIR}/${pattern}"
                     changed=1
                 fi
             fi
@@ -1571,7 +1611,7 @@ do_import() {
         [ -z "${f}" ] && continue
         if [ -f "${CONFIG_DIR}/${f}" ]; then
             mkdir -p "${BACKUP}/$(dirname "${f}")"
-            cp "${CONFIG_DIR}/${f}" "${BACKUP}/${f}"
+            cp -p "${CONFIG_DIR}/${f}" "${BACKUP}/${f}"
         fi
     done <<< "${CHANGED}"
 
@@ -1580,7 +1620,7 @@ do_import() {
         [ -z "${f}" ] && continue
         if [ -f "${REPO_DIR}/${f}" ]; then
             mkdir -p "${CONFIG_DIR}/$(dirname "${f}")"
-            cp "${REPO_DIR}/${f}" "${CONFIG_DIR}/${f}"
+            cp -p "${REPO_DIR}/${f}" "${CONFIG_DIR}/${f}"
             bashio::log.debug "Import: copied ${f}"
         fi
     done <<< "${CHANGED}"
@@ -1602,7 +1642,7 @@ do_import() {
         log_supervisor_error "Import: check-config API failed — rolling back"
         while IFS= read -r f; do
             [ -z "${f}" ] && continue
-            [ -f "${BACKUP}/${f}" ] && cp "${BACKUP}/${f}" "${CONFIG_DIR}/${f}"
+            [ -f "${BACKUP}/${f}" ] && cp -p "${BACKUP}/${f}" "${CONFIG_DIR}/${f}"
         done <<< "${CHANGED}"
         git reset --hard "${LOCAL}"
         rm -rf "${BACKUP}"
@@ -1687,7 +1727,7 @@ do_import() {
             # File-level rollback (existing pattern, mirrored from invalid-check path)
             while IFS= read -r f; do
                 [ -z "${f}" ] && continue
-                [ -f "${BACKUP}/${f}" ] && cp "${BACKUP}/${f}" "${CONFIG_DIR}/${f}"
+                [ -f "${BACKUP}/${f}" ] && cp -p "${BACKUP}/${f}" "${CONFIG_DIR}/${f}"
             done <<< "${CHANGED}"
             git reset --hard "${LOCAL}"
 
@@ -1735,7 +1775,7 @@ do_import() {
         bashio::log.warning "Import: rolling back to ${LOCAL:0:8}"
         while IFS= read -r f; do
             [ -z "${f}" ] && continue
-            [ -f "${BACKUP}/${f}" ] && cp "${BACKUP}/${f}" "${CONFIG_DIR}/${f}"
+            [ -f "${BACKUP}/${f}" ] && cp -p "${BACKUP}/${f}" "${CONFIG_DIR}/${f}"
         done <<< "${CHANGED}"
         git reset --hard "${LOCAL}"
         rm -rf "${BACKUP}"
