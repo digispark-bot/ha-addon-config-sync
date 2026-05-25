@@ -3,7 +3,7 @@
 # Source the bashio library (HA add-on option parsing + logging)
 source /usr/lib/bashio/bashio.sh
 # ---------------------------------------------------------------
-# Config Sync (GitOps) — HA Supervisor Add-on  v1.3.1
+# Config Sync (GitOps) — HA Supervisor Add-on  v1.4.0
 #
 # Bidirectional sync:
 #   IMPORT — pull config from GitHub → backup HA → validate → reload → verify
@@ -43,6 +43,20 @@ NOTIFY_ON_FAILURE=$(bashio::config 'notify_on_failure')
 if [ -z "${NOTIFY_ON_FAILURE}" ]; then
     NOTIFY_ON_FAILURE="true"
 fi
+
+# Whether to call /core/restart instead of reload_all when the sync
+# touches the lovelace key in configuration.yaml. Default: true.
+# reload_all does NOT re-register lovelace.dashboards entries — the
+# 2026-05-25 incident class needed manual restart after sync. Disabling
+# this option reverts to reload_all and re-introduces that failure mode.
+RESTART_ON_LOVELACE_CHANGE=$(bashio::config 'restart_on_lovelace_change')
+if [ -z "${RESTART_ON_LOVELACE_CHANGE}" ]; then
+    RESTART_ON_LOVELACE_CHANGE="true"
+fi
+
+# Extra settle seconds added to POST_SYNC_SETTLE when we used /core/restart
+# instead of reload_all — HA needs longer to come back from a full restart.
+RESTART_EXTRA_SETTLE=25
 
 # ── Constants ──────────────────────────────────────────────────────
 REPO_DIR="/data/repo"
@@ -404,6 +418,35 @@ reconcile_tracked_files() {
     return 0
 }
 
+# Returns 0 if this sync's diff on configuration.yaml between LOCAL and
+# REMOTE touches the lovelace key. Used to pick the reload strategy:
+# reload_all does NOT re-register lovelace.dashboards entries, so any
+# change to the lovelace block requires /core/restart.
+#
+# Cheap pre-check: configuration.yaml must be in CHANGED. If not, no
+# lovelace concern regardless of what changed elsewhere.
+#
+# Then: `git diff LOCAL REMOTE -- configuration.yaml | grep '^[+-].*lovelace'`
+# False positives (a YAML comment mentioning "lovelace") cause an extra
+# restart — acceptable cost vs missing the real case. False negatives
+# are not possible for the canonical case (any meaningful change to
+# the lovelace block contains the word "lovelace" somewhere in its
+# direct path).
+sync_touches_lovelace() {
+    if ! echo "${CHANGED}" | grep -qx 'configuration.yaml'; then
+        return 1
+    fi
+    git -C "${REPO_DIR}" diff "${LOCAL}" "${REMOTE}" -- configuration.yaml 2>/dev/null \
+        | grep -qiE '^[+-].*lovelace'
+}
+
+# Returns 0 if any file under themes/ is in CHANGED. New theme files
+# don't always get picked up by reload_all — frontend.reload_themes
+# refreshes the theme registry but doesn't reload the rest of HA.
+sync_touches_themes() {
+    echo "${CHANGED}" | grep -qE '^themes/'
+}
+
 # ── Git setup ─────────────────────────────────────────────────────
 
 # Configure git identity for export commits
@@ -718,22 +761,51 @@ do_import() {
     VALID=$(echo "${CHECK_RESULT}" | jq -r '.result // empty' 2>/dev/null)
 
     if [ "${VALID}" = "valid" ]; then
-        bashio::log.info "Import: config valid — reloading Home Assistant"
-        # Sprint 2: capture reload_all failure instead of silent || true.
-        # We don't abort on failure here — post-sync probes downstream
-        # will catch real breakage and trigger rollback. But the operator
-        # now sees the actual HTTP error if the reload itself failed.
-        if ! supervisor_api POST "/core/api/services/homeassistant/reload_all" > /dev/null; then
-            log_supervisor_error "reload_all API call failed — HA may not have picked up the changes"
-            bashio::log.warning "  Continuing to post-sync probes; they will catch any actual breakage."
+        # ── Reload-strategy selection (Sprint 3) ─────────────────────
+        # Pick the right way to apply the new config based on what changed:
+        #   - lovelace touched  → /core/restart (re-registers dashboards)
+        #   - themes touched    → reload_all + frontend.reload_themes
+        #   - everything else   → reload_all (lightest, current default)
+        #
+        # See sync_touches_lovelace() / sync_touches_themes() for the
+        # detection heuristics. Logged so the operator can see WHY a
+        # given strategy was used.
+        local reload_strategy reload_settle
+        if [ "${RESTART_ON_LOVELACE_CHANGE}" = "true" ] && sync_touches_lovelace; then
+            reload_strategy="/core/restart"
+            reload_settle=$((POST_SYNC_SETTLE + RESTART_EXTRA_SETTLE))
+            bashio::log.info "Import: configuration.yaml lovelace block changed — calling /core/restart (reload_all does NOT re-register dashboards)"
+            if ! supervisor_api POST "/core/api/services/homeassistant/restart" > /dev/null; then
+                log_supervisor_error "/core/restart API call failed"
+                bashio::log.warning "  Manual HA restart may be needed for lovelace dashboards to register."
+            fi
+        elif sync_touches_themes; then
+            reload_strategy="reload_all + frontend.reload_themes"
+            reload_settle="${POST_SYNC_SETTLE}"
+            bashio::log.info "Import: themes/ files changed — calling reload_all + frontend.reload_themes"
+            if ! supervisor_api POST "/core/api/services/homeassistant/reload_all" > /dev/null; then
+                log_supervisor_error "reload_all API call failed — HA may not have picked up the changes"
+                bashio::log.warning "  Continuing to post-sync probes; they will catch any actual breakage."
+            fi
+            if ! supervisor_api POST "/core/api/services/frontend/reload_themes" > /dev/null; then
+                log_supervisor_error "frontend.reload_themes API call failed — new themes may not activate until next HA restart"
+            fi
+        else
+            reload_strategy="reload_all"
+            reload_settle="${POST_SYNC_SETTLE}"
+            bashio::log.info "Import: config valid — reloading Home Assistant"
+            if ! supervisor_api POST "/core/api/services/homeassistant/reload_all" > /dev/null; then
+                log_supervisor_error "reload_all API call failed — HA may not have picked up the changes"
+                bashio::log.warning "  Continuing to post-sync probes; they will catch any actual breakage."
+            fi
         fi
-        bashio::log.info "Import: reload complete (${LOCAL:0:8} -> ${REMOTE:0:8})"
+        bashio::log.info "Import: ${reload_strategy} complete (${LOCAL:0:8} -> ${REMOTE:0:8})"
 
         # ── Post-sync verification probes ────────────────────────────
-        # Let HA settle after reload before probing. POST_SYNC_SETTLE
-        # defaults to 5s; bump via the post_sync_settle_seconds option
-        # if your HA setup is slow to recover from reload_all.
-        sleep "${POST_SYNC_SETTLE}"
+        # Let HA settle after reload/restart before probing. Wait time
+        # scales with the strategy: restart needs longer because HA
+        # core is fully reinitializing.
+        sleep "${reload_settle}"
         if ! post_sync_verify; then
             bashio::log.error "============================================================"
             bashio::log.error "POST-SYNC VERIFICATION FAILED — rolling back"
@@ -764,7 +836,7 @@ do_import() {
             rm -rf "${BACKUP}"
             notify_sync_failure \
                 "Config Sync: post-sync verification failed" \
-                "Reloaded ${REMOTE:0:8} but HA failed health probes afterward. Files rolled back to ${LOCAL:0:8}. **If HA is still broken, restore backup \`gitops-pre-${REMOTE:0:8}\`** via Settings → System → Backups. Check the add-on log for the failed probe details."
+                "Applied ${reload_strategy} for ${REMOTE:0:8} but HA failed health probes afterward. Files rolled back to ${LOCAL:0:8}. **If HA is still broken, restore backup \`gitops-pre-${REMOTE:0:8}\`** via Settings → System → Backups. Check the add-on log for the failed probe details."
             return 1
         fi
 
