@@ -1,5 +1,45 @@
 # Changelog
 
+## 1.6.2
+
+Sprint 6 housekeeping release from the 2026-05-25 code-and-security
+review — closes the remaining LOW-severity items that warrant action
+(L12, L16, L18, L19). No new MEDIUMs in this sprint; **M8** (commit
+signature verification) remains deferred per the review's "Backlog
+(when warranted)" classification. **L17** (git release tags) is an
+out-of-tree operator action documented separately.
+
+- **Fix (Review L12)**: every `cp` call that moves config content now
+  passes `-p` to preserve timestamps. Lets operators correlate
+  `ls -l /config` mtimes against GitHub commit authorship times.
+  Cosmetic but useful for forensics.
+
+- **Fix (Review L16)**: `/tmp/.sup_resp_body` and `/tmp/.sup_resp_code`
+  are now created via `mktemp` with unique per-PID suffixes; a `trap
+  ... EXIT` cleans them up on add-on stop. Today's single-threaded
+  loop wouldn't have raced, but a future feature (background export,
+  parallel agent calls) would have collided on the shared paths.
+  Future-proofing with no behavior change for current code.
+
+- **Feature (Review L18)**: New optional config `pre_sync_backup_name_prefix`
+  (default `"gitops-pre-"`, backward compatible). Operators who keep
+  their own manual `gitops-pre-*` HA backups can pick a different
+  prefix to avoid collision with the add-on's retention prune. WARNING
+  in DOCS: changing the prefix abandons any backups taken under the
+  prior prefix — they look like operator backups and are never pruned.
+
+- **Fix (Review L19)**: Defensive INFO log in `prune_pre_sync_backups()`
+  when Supervisor returns an empty backup list AND lifetime sync_count
+  is ≥ 5. Surfaces the case where a future HA major-version renames
+  `.data.backups` and the jq filter silently no-ops. Threshold filters
+  out false positives from brand-new installs.
+
+- **New options**: `pre_sync_backup_name_prefix: "str?"` (default
+  `"gitops-pre-"`).
+
+- **No permission changes**; no behavior change for operators using
+  default settings; no new dependencies.
+
 ## 1.6.1
 
 Sprint 5 P2 from the 2026-05-25 code-and-security review — closes the

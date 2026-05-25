@@ -61,6 +61,7 @@ When `export_enabled` is true:
 | `notify_on_failure` | No | `true` | Raise HA persistent_notification on every sync failure. |
 | `strict_sync_paths_check` | No | `true` | Abort sync if !include_dir_* directives reference directories outside sync_paths. (v1.5.1+) |
 | `pre_sync_backup_retention` | No | `7` | How many `gitops-pre-*` HA backups to keep. `0` disables pruning. (v1.5.2+) |
+| `pre_sync_backup_name_prefix` | No | `gitops-pre-` | Prefix for pre-sync HA backup names (v1.6.2+). Whatever prefix is set is what retention-prune matches on — changing it leaves old auto-backups untracked, so prune will leave them alone forever. |
 | `allowed_repo_hosts` | No | `["github.com"]` | List of hostnames `github_repo` is allowed to point at (v1.6.0+). Subdomain matches allowed via suffix-match. Add your GitHub Enterprise hostname here if applicable. Setting this to an empty list defaults back to `["github.com"]`. |
 | `block_symlinks` | No | `true` | Abort sync if any tracked file in `sync_paths` is a symlink (v1.6.0+). Symlinks in tracked config files are a path-traversal vector. Set to `false` if you intentionally use symlinks and accept the risk. |
 
