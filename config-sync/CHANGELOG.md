@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.2.0
+
+- **Feature (safety)**: Before any `/config/` write, take a partial HA
+  backup via the Supervisor API named `gitops-pre-<short_sha>` covering
+  the `homeassistant` folder. If the backup API returns non-2xx, abort
+  the sync and roll the local git state back to the pre-merge SHA so
+  the next cycle retries. Storage-level safety net for the class of
+  failure where file-level rollback can't recover (e.g. .storage/
+  corruption). See issue #4.
+- **Feature (safety)**: After `reload_all`, sleep `post_sync_settle_seconds`
+  (new config option, default 5s) and then run two health probes against
+  the Supervisor Core API:
+  - `GET /core/api/states/sun.sun` — state machine alive
+  - `GET /core/api/` — auth + REST responsive
+  Either probe failing triggers file-level rollback, a best-effort
+  re-reload, and a prominent ERROR block pointing the operator at
+  the pre-sync HA backup for storage-level restore. Catches the
+  bug class where check_config passes but reload breaks HA (e.g.
+  the [JLay2026/nanoclaw-zimaos#50](https://github.com/JLay2026/nanoclaw-zimaos/issues/50)
+  2026-05-25 incident — frontend rendering failure with valid YAML).
+  See issue #5.
+- **New option**: `post_sync_settle_seconds: int(0,60)` (default 5).
+  Bump for slow HA setups; 0 disables the settle delay (probes run
+  immediately after reload_all returns).
+- **Helper extension**: `supervisor_api()` now accepts an optional third
+  argument (JSON body) so the backup API call can POST a request body.
+  Existing callers (check_config, reload_all, states) are unchanged.
+
 ## 1.1.7
 
 - **Feature**: At startup, scan `configuration.yaml` for `!include_dir_*`
