@@ -33,6 +33,14 @@ back to GitHub automatically.
     the most-recent `pre_sync_backup_retention` (default 7) and deletes the
     rest. The just-created backup is always in the keep set.
 
+Network operations to GitHub (`git fetch`, `git push`, `git clone`)
+are hard-bounded by `GIT_HTTP_LOW_SPEED_LIMIT=1000` +
+`GIT_HTTP_LOW_SPEED_TIMEOUT=60` as of v1.5.4 — they abort if
+throughput stays below 1 KB/s for 60 seconds. Supervisor API calls
+are similarly bounded by `--max-time 30 --connect-timeout 5`.
+Without these, a stalled network or hung Supervisor would wedge the
+single-threaded sync loop indefinitely.
+
 ### Export (HA → GitHub)
 
 When `export_enabled` is true:
@@ -137,12 +145,43 @@ Public repo import works without a PAT.
 3. Check the `repo` scope (grants read/write to all your repos).
 4. Click **Generate token** and paste it into `github_pat`.
 
-Fine-grained is preferred because it limits access to a single repository
-with only the permissions the add-on actually uses (`git clone` and
-`git push`). Classic PATs grant broader access across all repositories.
+Fine-grained is **strongly preferred** because it limits the blast
+radius if the token is ever exfiltrated — see the PAT-handling note in
+"Where the PAT lives at runtime" below.
 
-The token is stored in HA's encrypted add-on option store and is never
-written to disk inside the container.
+#### Where the PAT lives at runtime (v1.5.4 correction)
+
+The PAT you paste into the add-on UI is stored encrypted at rest by the
+Home Assistant Supervisor (HA's add-on options store).
+
+**However, at runtime, the add-on writes the PAT to
+`/data/repo/.git/config` on disk inside the add-on container**, as
+part of the HTTPS remote URL
+(`https://<PAT>@github.com/<owner>/<repo>.git`). This is how git
+authenticates fetch/push without a credential helper. The `/data/`
+path is on the persistent add-on volume — the PAT survives container
+restart.
+
+Anyone with `docker exec` access to the add-on container (i.e. anyone
+with HAOS admin + host-level access) can read the PAT in plaintext
+from that file. The PAT is **also** scrubbed from log output by
+`sanitize_output()` (v1.1.6+, hardened against glob-char fragility in
+v1.5.4) so it doesn't leak into the add-on log even on git error
+output.
+
+**Recommendation**: use a fine-grained PAT scoped to the single GitHub
+repo you sync, with Contents: read+write only. That way if the PAT is
+ever exfiltrated, the attacker gets push access to one repo and
+nothing else — not your whole GitHub account. Rotate the PAT
+periodically by pasting a new one into the add-on options (the old
+one is overwritten in `.git/config` on the next add-on restart).
+
+A future release may add an optional git credential helper to keep
+the PAT out of `.git/config` entirely. Not yet implemented.
+
+(Prior to v1.5.4, this section incorrectly claimed the PAT was "never
+written to disk inside the container." That was a documentation bug,
+not a code change — the PAT has always been written to `.git/config`.)
 
 ## Workflows
 
@@ -222,12 +261,22 @@ name for manual backups you want to keep.
 - **No manual HA tokens.** The add-on uses the auto-injected `$SUPERVISOR_TOKEN`
   for HA API calls.
 - **No Samba.** Direct `/config` access via the Supervisor's `map: config:rw`.
-- **No inbound ports.** Only outbound HTTPS to GitHub.
+- **No inbound ports.** Only outbound HTTPS to GitHub and outbound HTTP
+  to the Supervisor unix-socket-style endpoint.
+- **Network timeouts on every outbound call (v1.5.4+)**: Supervisor API
+  calls are bounded by `--max-time 30 --connect-timeout 5`; git network
+  operations are bounded by `GIT_HTTP_LOW_SPEED_LIMIT=1000` +
+  `GIT_HTTP_LOW_SPEED_TIMEOUT=60`. A hung remote can no longer wedge
+  the single-threaded sync loop indefinitely.
 - **Rollback on failure.** Invalid imports are automatically reverted. Storage-level
   rollback available via the `gitops-pre-<sha>` HA backup taken before each sync.
-- **GitHub PAT** is stored in HA's encrypted add-on option store.
-  Fine-grained tokens scoped to a single repo with Contents read/write
-  are recommended over classic tokens with broad `repo` scope.
+- **GitHub PAT** is encrypted at rest by HA's options store, then
+  written to `.git/config` in plaintext inside the add-on container
+  at runtime. See "Where the PAT lives at runtime" under GitHub
+  Personal Access Token above for the full picture and the strong
+  recommendation to use a fine-grained PAT scoped to a single repo.
+- **PAT scrubbing in logs** via `sanitize_output()` (v1.1.6+, hardened
+  in v1.5.4 against glob-char fragility).
 - **Export commits** are attributed to `HA Config Sync <config-sync@homeassistant.local>`
   for clear audit trail in git history.
 

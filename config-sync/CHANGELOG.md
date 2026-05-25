@@ -1,5 +1,51 @@
 # Changelog
 
+## 1.5.4
+
+Sprint 5 P0 from the 2026-05-25 code-and-security review. Fixes the
+two HIGH findings (no network timeouts — a hung curl or git would
+wedge the entire single-threaded sync loop) and the related MEDIUM/LOW
+findings about credential-handling fragility. No new config options;
+no behavior change in the happy path.
+
+- **Fix (Review H1)**: `supervisor_api()` now passes `--max-time 30
+  --connect-timeout 5` to every `curl` call. Without these, a hung
+  Supervisor would block indefinitely; the single-threaded sync loop
+  has no concurrent recovery path. New constants `SUPERVISOR_API_TIMEOUT`
+  (default 30s) and `SUPERVISOR_API_CONNECT_TIMEOUT` (default 5s).
+  Timeouts surface as `HTTP 000` in the existing diagnostic path — the
+  log line distinguishes "unreachable" from "timed out".
+- **Fix (Review H2)**: Script top now exports `GIT_HTTP_LOW_SPEED_LIMIT=1000`
+  and `GIT_HTTP_LOW_SPEED_TIMEOUT=60`. Same shape as H1 but for
+  `git fetch` / `git push` / `git clone` — a flaky GitHub connection
+  no longer hangs the loop. Git aborts the operation if throughput stays
+  below 1 KB/s for 60 seconds.
+- **Fix (Review M4)**: Replaced sed-based PAT URL substitution
+  (`echo "${REPO}" | sed "s|https://|https://${PAT}@|"`) with bash
+  parameter expansion (`${REPO/https:\/\//https:\/\/${PAT}@}`). The sed
+  form was fragile to `|`, `&`, or `/` in the PAT — it would silently
+  produce a broken URL because of delimiter collision or metachar
+  interpretation. Current GitHub PAT format doesn't use these chars
+  but the script will no longer silently fail if that ever changes.
+  Two locations: `CLONE_URL` (line ~1003) and `AUTH_URL` (line ~1011).
+  Same fix as shellcheck SC2001.
+- **Fix (Review M5)**: `sanitize_output()` now quotes the search side
+  of its pattern substitution: `${text//"${PAT}"/***}`. Without
+  quoting, glob characters in the PAT (`*`, `?`, `[`, `]`) would be
+  interpreted as bash patterns rather than literal characters, and the
+  PAT would silently fail to scrub from log output. The fix forces
+  literal-string matching.
+- **Fix (Review L13)**: `rel="${src#"${CONFIG_DIR}"/}"` — quote the
+  inner expansion in the parameter-substitution pattern. Same class as
+  M5, different location (the export-side staging loop). Resolves
+  shellcheck SC2295.
+- **Diagnostic improvement**: `log_supervisor_error()` now mentions the
+  timeout value in the "no response" branch ("Supervisor unreachable or
+  timed out after ${SUPERVISOR_API_TIMEOUT}s") so the operator can tell
+  the difference between network-broken and Supervisor-hung.
+- **No new config options**; no schema changes; no permission changes.
+  Existing deployments get all five fixes automatically on update.
+
 ## 1.5.3
 
 Sprint 4 P3 from the hardening plan (see issue #9) — the final item.
