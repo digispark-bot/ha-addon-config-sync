@@ -3,10 +3,10 @@
 # Source the bashio library (HA add-on option parsing + logging)
 source /usr/lib/bashio/bashio.sh
 # ---------------------------------------------------------------
-# Config Sync (GitOps) — HA Supervisor Add-on  v1.1.7
+# Config Sync (GitOps) — HA Supervisor Add-on  v1.2.0
 #
 # Bidirectional sync:
-#   IMPORT — pull config from GitHub → validate → reload HA
+#   IMPORT — pull config from GitHub → backup HA → validate → reload → verify
 #   EXPORT — detect HA-side changes → commit + push to GitHub
 #
 # All configuration is read from the HA add-on options GUI
@@ -28,6 +28,13 @@ EXPORT_ENABLED=$(bashio::config 'export_enabled')
 EXPORT_INTERVAL=$(bashio::config 'export_interval')
 EXPORT_BRANCH=$(bashio::config 'export_branch')
 EXPORT_MSG=$(bashio::config 'export_commit_message')
+
+# Post-sync verify settle window — how many seconds to wait after reload_all
+# before running the verification probes. Defaults to 5 if unset.
+POST_SYNC_SETTLE=$(bashio::config 'post_sync_settle_seconds')
+if [ -z "${POST_SYNC_SETTLE}" ]; then
+    POST_SYNC_SETTLE=5
+fi
 
 # ── Constants ──────────────────────────────────────────────────────
 REPO_DIR="/data/repo"
@@ -77,14 +84,22 @@ path_allowed() {
     return 1
 }
 
-# Call the Supervisor API.  $1 = method, $2 = endpoint.
+# Call the Supervisor API.
+#   $1 = method (GET, POST, etc)
+#   $2 = endpoint (e.g. "/core/api/states/sun.sun")
+#   $3 = optional JSON body (string)
+# Returns curl's exit code (0 on 2xx, non-zero on transport/HTTP error).
+# Writes the response body to stdout.
 supervisor_api() {
-    local method="$1" endpoint="$2"
-    curl -sf -X "${method}" \
-        "http://supervisor${endpoint}" \
-        -H "Authorization: Bearer ${SUPERVISOR_TOKEN}" \
-        -H "Content-Type: application/json" \
-        2>/dev/null
+    local method="$1" endpoint="$2" body="${3:-}"
+    local -a args=(-sf -X "${method}"
+                   "http://supervisor${endpoint}"
+                   -H "Authorization: Bearer ${SUPERVISOR_TOKEN}"
+                   -H "Content-Type: application/json")
+    if [ -n "${body}" ]; then
+        args+=(-d "${body}")
+    fi
+    curl "${args[@]}" 2>/dev/null
 }
 
 # Audit configuration.yaml for !include_dir_* directives whose target
@@ -128,6 +143,73 @@ audit_include_dir_directives() {
     else
         bashio::log.warning "audit: ${found_gaps} sync_paths gap(s) detected — see WARNINGs above"
     fi
+}
+
+# Trigger a partial HA backup via the Supervisor API before applying
+# a sync. The backup is async on HA's side (we don't wait for the
+# file write to complete); we only block on the API accepting the
+# request.
+#
+# Scope: only the `homeassistant` folder (covers /config and .storage).
+# Add-on data, ssl, share, media are excluded — they're not in the
+# sync's mutation surface and keeping them out keeps the per-sync
+# backup small + fast.
+#
+# Returns 0 if the backup request was accepted (HTTP 2xx), non-zero
+# otherwise. On non-zero, the caller MUST abort the sync — we never
+# write to /config without a backup in place.
+#
+# See: GitHub issue #4, and the JLay2026/nanoclaw-zimaos#50 incident.
+ha_backup_pre_sync() {
+    local target_sha="$1"
+    local name="gitops-pre-${target_sha:0:8}"
+    local body
+    # JSON body. addons=[] folders=["homeassistant"] compressed=true
+    body=$(printf '{"name":"%s","addons":[],"folders":["homeassistant"],"compressed":true}' "${name}")
+    if ! supervisor_api POST "/backups/new/partial" "${body}" > /dev/null; then
+        bashio::log.error "Pre-sync HA backup API failed — REFUSING to sync"
+        bashio::log.error "  Probable causes: backup integration not loaded, Supervisor unreachable,"
+        bashio::log.error "  insufficient disk space, or the partial-backup endpoint moved in HA."
+        bashio::log.error "  Diagnostic: 'ha core info' on the host, or check Supervisor logs."
+        return 1
+    fi
+    bashio::log.info "Pre-sync HA backup '${name}' triggered — Settings → System → Backups"
+    return 0
+}
+
+# Run health probes after reload_all to catch breakage that
+# check_config missed. Returns 0 if both probes pass, non-zero
+# otherwise.
+#
+# Probe 1: GET /core/api/states/sun.sun
+#   sun.sun is always present on HAOS. Failure here means HA's state
+#   machine is not serving — core is down, restart wedged, or reload
+#   deadlocked.
+#
+# Probe 2: GET /core/api/
+#   Returns {"message":"API running."} on healthy + authenticated.
+#   This is the probe that catches the 2026-05-25 bug class — a config
+#   that passes check_config but breaks frontend rendering / auth UI.
+#
+# See: GitHub issue #5.
+post_sync_verify() {
+    bashio::log.debug "Post-sync verify: probe 1/2 — sun.sun state lookup"
+    if ! supervisor_api GET "/core/api/states/sun.sun" > /dev/null; then
+        bashio::log.error "Post-sync probe 1 FAILED: sun.sun unreachable"
+        bashio::log.error "  HA may be down, restarting, or its state machine isn't serving."
+        return 1
+    fi
+
+    bashio::log.debug "Post-sync verify: probe 2/2 — /core/api/ auth + responsiveness"
+    if ! supervisor_api GET "/core/api/" > /dev/null; then
+        bashio::log.error "Post-sync probe 2 FAILED: /core/api/ unresponsive or auth rejected"
+        bashio::log.error "  Possible causes: auth provider broken, frontend assets missing,"
+        bashio::log.error "  integration crashed during reload. THIS IS THE 2026-05-25 BUG CLASS."
+        return 1
+    fi
+
+    bashio::log.info "Post-sync verify: both probes passed — sync verified healthy"
+    return 0
 }
 
 # ── Git setup ─────────────────────────────────────────────────────
@@ -337,7 +419,18 @@ do_import() {
 
     bashio::log.info "Import: syncing $(echo "${CHANGED}" | tr '\n' ' ')"
 
-    # Backup affected files
+    # ── Pre-sync HA backup (storage-level safety net) ────────────────
+    # If this fails, we MUST roll back the git merge so the next cycle
+    # re-attempts the same commit. Otherwise the next iteration sees
+    # LOCAL==REMOTE and silently skips the pending changes.
+    if ! ha_backup_pre_sync "${REMOTE}"; then
+        bashio::log.error "Aborting sync — rolling back git state to ${LOCAL:0:8}; next cycle will retry"
+        git reset --hard "${LOCAL}"
+        return 1
+    fi
+
+    # Backup affected files (existing file-level rollback — belt + suspenders
+    # with the storage-level HA backup above)
     BACKUP="${ROLLBACK_DIR}/${LOCAL:0:8}"
     rm -rf "${BACKUP}"
     mkdir -p "${BACKUP}"
@@ -380,6 +473,39 @@ do_import() {
         bashio::log.info "Import: config valid — reloading Home Assistant"
         supervisor_api POST "/core/api/services/homeassistant/reload_all" > /dev/null 2>&1 || true
         bashio::log.info "Import: reload complete (${LOCAL:0:8} -> ${REMOTE:0:8})"
+
+        # ── Post-sync verification probes ────────────────────────────
+        # Let HA settle after reload before probing. POST_SYNC_SETTLE
+        # defaults to 5s; bump via the post_sync_settle_seconds option
+        # if your HA setup is slow to recover from reload_all.
+        sleep "${POST_SYNC_SETTLE}"
+        if ! post_sync_verify; then
+            bashio::log.error "============================================================"
+            bashio::log.error "POST-SYNC VERIFICATION FAILED — rolling back"
+            bashio::log.error "============================================================"
+
+            # File-level rollback (existing pattern, mirrored from invalid-check path)
+            while IFS= read -r f; do
+                [ -z "${f}" ] && continue
+                [ -f "${BACKUP}/${f}" ] && cp "${BACKUP}/${f}" "${CONFIG_DIR}/${f}"
+            done <<< "${CHANGED}"
+            git reset --hard "${LOCAL}"
+
+            # Best-effort re-reload with the rolled-back files. If HA is
+            # too broken for this to succeed, the operator restores from
+            # the pre-sync HA backup below.
+            bashio::log.warning "Attempting re-reload of rolled-back files..."
+            supervisor_api POST "/core/api/services/homeassistant/reload_all" > /dev/null 2>&1 || true
+
+            bashio::log.error ""
+            bashio::log.error "If HA is still broken, restore the pre-sync backup:"
+            bashio::log.error "  Settings → System → Backups → 'gitops-pre-${REMOTE:0:8}'"
+            bashio::log.error "============================================================"
+
+            rm -rf "${BACKUP}"
+            return 1
+        fi
+
         rm -rf "${BACKUP}"
         # Mark that we just imported — export should skip next cycle
         git rev-parse HEAD > "${LAST_IMPORT_MARKER}"
