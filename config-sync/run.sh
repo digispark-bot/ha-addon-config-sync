@@ -3,7 +3,7 @@
 # Source the bashio library (HA add-on option parsing + logging)
 source /usr/lib/bashio/bashio.sh
 # ---------------------------------------------------------------
-# Config Sync (GitOps) — HA Supervisor Add-on  v1.5.1
+# Config Sync (GitOps) — HA Supervisor Add-on  v1.5.2
 #
 # Bidirectional sync:
 #   IMPORT — pull config from GitHub → backup HA → validate → reload → verify
@@ -63,6 +63,18 @@ fi
 STRICT_SYNC_PATHS_CHECK=$(bashio::config 'strict_sync_paths_check')
 if [ -z "${STRICT_SYNC_PATHS_CHECK}" ]; then
     STRICT_SYNC_PATHS_CHECK="true"
+fi
+
+# How many gitops-pre-* HA backups to retain (v1.5.2, Sprint 4 P2).
+# After every sync cycle that took a backup, the add-on enumerates all
+# HA backups whose name starts with "gitops-pre-", sorts by date desc,
+# and deletes everything past the Nth most recent. Default 7 — covers
+# roughly a week of one-sync-per-day deploys.
+#   0  = never prune (v1.5.1 behavior: backups accumulate forever)
+#   N  = keep the N most recent gitops-pre-* backups
+PRE_SYNC_BACKUP_RETENTION=$(bashio::config 'pre_sync_backup_retention')
+if [ -z "${PRE_SYNC_BACKUP_RETENTION}" ]; then
+    PRE_SYNC_BACKUP_RETENTION=7
 fi
 
 # Extra settle seconds added to POST_SYNC_SETTLE when we used /core/restart
@@ -724,6 +736,60 @@ ha_backup_pre_sync() {
     return 0
 }
 
+# Prune old gitops-pre-* HA backups, keeping only the most-recent
+# PRE_SYNC_BACKUP_RETENTION (v1.5.2, Sprint 4 P2). Called after every
+# sync cycle that took a backup, regardless of success or failure.
+#
+# The just-created backup is always in the "keep" set (it's the most
+# recent by date), so a freshly-failed sync's restore point is never
+# deleted in the same cycle that failed.
+#
+# Best-effort: list / delete failures log WARN but never propagate.
+# If PRE_SYNC_BACKUP_RETENTION is 0, this is a no-op (v1.5.1 behavior).
+prune_pre_sync_backups() {
+    if [ "${PRE_SYNC_BACKUP_RETENTION}" -le 0 ]; then
+        return 0
+    fi
+
+    local list_json
+    if ! list_json=$(supervisor_api GET "/backups"); then
+        bashio::log.debug "prune_pre_sync_backups: failed to list backups (HTTP $(cat "${SUPERVISOR_RESP_CODE_FILE}" 2>/dev/null || echo ???)) — will retry next cycle"
+        return 0
+    fi
+
+    # Filter to gitops-pre-* by name, sort by date descending, drop the
+    # first N (the keep set), emit slugs of the rest. jq's .[$keep:]
+    # slice on an empty / nil list yields empty output safely.
+    local doomed_slugs
+    doomed_slugs=$(echo "${list_json}" | jq -r \
+        --argjson keep "${PRE_SYNC_BACKUP_RETENTION}" \
+        '(.data.backups // []) | map(select(.name | startswith("gitops-pre-"))) | sort_by(.date) | reverse | .[$keep:] | .[] | .slug' \
+        2>/dev/null)
+
+    if [ -z "${doomed_slugs}" ]; then
+        # No prune candidates this cycle.
+        return 0
+    fi
+
+    local deleted=0 failed=0
+    while IFS= read -r slug; do
+        [ -z "${slug}" ] && continue
+        if supervisor_api DELETE "/backups/${slug}" > /dev/null; then
+            deleted=$((deleted + 1))
+            bashio::log.debug "prune_pre_sync_backups: deleted ${slug}"
+        else
+            failed=$((failed + 1))
+            bashio::log.warning "prune_pre_sync_backups: failed to delete ${slug} (HTTP $(cat "${SUPERVISOR_RESP_CODE_FILE}" 2>/dev/null || echo ???))"
+        fi
+    done <<< "${doomed_slugs}"
+
+    if [ "${deleted}" -gt 0 ] || [ "${failed}" -gt 0 ]; then
+        bashio::log.info "Pre-sync backup retention: pruned ${deleted}, failed ${failed} (keeping last ${PRE_SYNC_BACKUP_RETENTION})"
+        sync_log INFO "event=backup_prune retention=${PRE_SYNC_BACKUP_RETENTION} deleted=${deleted} failed=${failed}"
+    fi
+    return 0
+}
+
 # Run health probes after reload_all to catch breakage that
 # check_config missed. Returns 0 if both probes pass, non-zero
 # otherwise.
@@ -1209,6 +1275,7 @@ do_import() {
         status_mark_failure "${REMOTE}" "check_config_api" \
             "Supervisor check_config endpoint did not respond (HTTP $(cat "${SUPERVISOR_RESP_CODE_FILE}" 2>/dev/null || echo ???)); rolled back to ${LOCAL:0:8}" \
             "${backup_name}"
+        prune_pre_sync_backups
         sync_log_close failure
         return 1
     }
@@ -1308,6 +1375,7 @@ do_import() {
             status_mark_failure "${REMOTE}" "post_sync_verify" \
                 "Post-${reload_strategy_key} health probes failed; rolled back to ${LOCAL:0:8}. Restore backup ${backup_name} if HA is still broken." \
                 "${backup_name}"
+            prune_pre_sync_backups
             sync_log_close failure
             return 1
         fi
@@ -1352,6 +1420,13 @@ do_import() {
             rm -rf "${ROLLBACK_DIR:?}/${old}"
         done
     fi
+
+    # Prune old gitops-pre-* HA backups (v1.5.2, Sprint 4 P2). Runs on
+    # both success and check_config-invalid fall-through paths. The
+    # early-return failure paths (post_sync_verify, check_config_api)
+    # have their own prune calls inline. Sync_paths_gap + pre_sync_backup
+    # early aborts never created a backup so nothing to prune.
+    prune_pre_sync_backups
 
     return 0
 }
