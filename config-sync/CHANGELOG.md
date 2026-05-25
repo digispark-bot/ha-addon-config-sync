@@ -1,5 +1,41 @@
 # Changelog
 
+## 1.4.0
+
+Sprint 3 P0 from the hardening plan (see issue #9): pick the right
+reload strategy automatically so the 2026-05-25 incident class (lovelace
+dashboards needed manual restart after sync) never recurs.
+
+- **Feature (Sprint 3 P0)**: Three-way reload-strategy selection in
+  `do_import()` after check_config validates:
+  - `/core/restart` (heavy, ~30s downtime) when the diff touches the
+    lovelace key in `configuration.yaml`. `reload_all` does NOT
+    re-register `lovelace.dashboards` entries — this was the bug from
+    the 2026-05-25 incident.
+  - `reload_all` + `frontend.reload_themes` when any `themes/` file
+    changed but lovelace didn't. Reloads YAML domains and refreshes
+    the theme registry.
+  - `reload_all` (lightest, default) for everything else. Unchanged
+    behavior for the typical case.
+- **New helpers**: `sync_touches_lovelace()` uses `git diff LOCAL..REMOTE
+  -- configuration.yaml` to detect any `+/-` line matching `/lovelace/i`.
+  `sync_touches_themes()` checks if `^themes/` appears in `CHANGED`.
+  Both are cheap (one git diff, one grep) and emit no log noise on
+  the common case.
+- **New option**: `restart_on_lovelace_change: bool` (default `true`).
+  Operators on latency-sensitive setups can disable to revert to
+  `reload_all` for lovelace changes (with the known caveat that
+  dashboards won't re-register until manual restart).
+- **Adaptive post-sync settle**: when the chosen strategy is restart,
+  the post-sync settle window grows by 25s (default total: 30s) so
+  HA has time to come back from the full restart before the health
+  probes run.
+- **Failure-notification message** updated to include the actual
+  strategy ("Applied /core/restart for…" vs "Applied reload_all for…")
+  so the operator immediately knows what was attempted.
+- No breaking changes; new option defaults to true so existing
+  deployments get the heuristic automatically on update.
+
 ## 1.3.1
 
 Sprint 2 P1 follow-up to v1.3.0 — surface sync failures in the HA UI so
