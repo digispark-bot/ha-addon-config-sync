@@ -3,7 +3,7 @@
 # Source the bashio library (HA add-on option parsing + logging)
 source /usr/lib/bashio/bashio.sh
 # ---------------------------------------------------------------
-# Config Sync (GitOps) — HA Supervisor Add-on  v1.6.0
+# Config Sync (GitOps) — HA Supervisor Add-on  v1.6.1
 #
 # Bidirectional sync:
 #   IMPORT — pull config from GitHub → backup HA → validate → reload → verify
@@ -28,6 +28,16 @@ REPO=$(bashio::config 'github_repo')
 BRANCH=$(bashio::config 'branch')
 INTERVAL=$(bashio::config 'check_interval')
 PAT=$(bashio::config 'github_pat')
+
+# v1.6.1 (Review M3): export PAT to git subprocess environment so the
+# credential helper can read it at git-command time. The PAT is NEVER
+# written to .git/config under this scheme — the helper string stored
+# there references ${GH_CONFIG_SYNC_PAT} literally; bash expands it
+# when git invokes the helper, not when git stores the config value.
+# GIT_TERMINAL_PROMPT=0 prevents git from blocking on a prompt if the
+# helper somehow fails to produce credentials.
+export GH_CONFIG_SYNC_PAT="${PAT}"
+export GIT_TERMINAL_PROMPT=0
 
 # Export options
 EXPORT_ENABLED=$(bashio::config 'export_enabled')
@@ -1182,27 +1192,43 @@ check_repo_host_allowed
 git config --global user.name "HA Config Sync"
 git config --global user.email "config-sync@homeassistant.local"
 
+# Git credential helper (v1.6.1, Review M3). The literal string below
+# is what's stored in .git/config — NOT the resolved PAT value. Bash
+# expands ${GH_CONFIG_SYNC_PAT} when git invokes the helper, so the
+# PAT never lands on disk. Compare with v1.5.x/v1.6.0 which embedded
+# the PAT directly in the HTTPS remote URL (persisted in .git/config).
+GIT_CREDENTIAL_HELPER='!f() { echo username=x-access-token; echo "password=${GH_CONFIG_SYNC_PAT}"; }; f'
+
 # ── Initial clone ──────────────────────────────────────────────────
 if [ ! -d "${REPO_DIR}/.git" ]; then
     bashio::log.info "First run — cloning ${REPO} (branch: ${BRANCH})"
-    CLONE_URL="${REPO}"
     if [ -n "${PAT}" ]; then
-        # v1.5.4 (M4): bash parameter expansion replaces sed.
-        # sed delimiter "|" would break if PAT ever contained |, &, or /;
-        # bash ${var/pattern/repl} substitutes literally, no fork to sed.
-        CLONE_URL="${REPO/https:\/\//https:\/\/${PAT}@}"
+        # v1.6.1 (M3): inline credential helper via -c so the one-time
+        # clone authenticates without ever writing the PAT to disk.
+        git -c "credential.helper=${GIT_CREDENTIAL_HELPER}" \
+            clone --branch "${BRANCH}" --single-branch "${REPO}" "${REPO_DIR}"
+    else
+        git clone --branch "${BRANCH}" --single-branch "${REPO}" "${REPO_DIR}"
     fi
-    git clone --branch "${BRANCH}" --single-branch "${CLONE_URL}" "${REPO_DIR}"
     bashio::log.info "Clone complete"
 fi
 
-# Ensure remote URL has current PAT
+# Ensure remote URL is the plain HTTPS URL (no PAT embedded).
+# v1.6.1 (M3): plain URL + credential helper replaces the URL-embedding
+# approach used through v1.6.0. On upgrade from v1.5.x/v1.6.0 this
+# overwrites any prior PAT-in-URL config, cleaning the PAT from
+# .git/config on first startup after the upgrade. Idempotent.
+git -C "${REPO_DIR}" remote set-url origin "${REPO}"
+
+# Configure (or remove) the credential helper in .git/config.
+# When a PAT is set: install the helper string. The string references
+# ${GH_CONFIG_SYNC_PAT} as a literal — bash expands at git-command time.
+# When no PAT is set: strip any prior helper so a stale empty-password
+# config doesn't linger.
 if [ -n "${PAT}" ]; then
-    # v1.5.4 (M4): bash parameter expansion replaces sed. See CLONE_URL above.
-    AUTH_URL="${REPO/https:\/\//https:\/\/${PAT}@}"
-    git -C "${REPO_DIR}" remote set-url origin "${AUTH_URL}"
+    git -C "${REPO_DIR}" config credential.helper "${GIT_CREDENTIAL_HELPER}"
 else
-    git -C "${REPO_DIR}" remote set-url origin "${REPO}"
+    git -C "${REPO_DIR}" config --unset credential.helper 2>/dev/null || true
 fi
 
 # Build the path allowlist once at startup.
