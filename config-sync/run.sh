@@ -3,7 +3,7 @@
 # Source the bashio library (HA add-on option parsing + logging)
 source /usr/lib/bashio/bashio.sh
 # ---------------------------------------------------------------
-# Config Sync (GitOps) — HA Supervisor Add-on  v1.2.1
+# Config Sync (GitOps) — HA Supervisor Add-on  v1.3.0
 #
 # Bidirectional sync:
 #   IMPORT — pull config from GitHub → backup HA → validate → reload → verify
@@ -280,6 +280,63 @@ post_sync_verify() {
     return 0
 }
 
+# Reconcile pass: ensure every tracked file matching sync_paths exists
+# on /config. Catches the bug class where a file is tracked in the repo
+# but was never modified in any commit reaching /config — the diff-based
+# sync never copies it, and a !include directive against it then fails
+# check_config (the M5.6 deploy saga that needed 3 PRs to work around).
+#
+# Runs as the LAST step before check_config in do_import(), but ONLY on
+# import cycles that have syncable changes (no overhead on no-op cycles).
+#
+# Cost: one stat per tracked file + cp for any missing. On a clean repo
+# this is sub-50ms even for hundreds of tracked files. On a repo with
+# gaps, it logs each reconciliation so the operator sees the catch.
+#
+# Returns 0 always; reconciliation failures (rare — cp to /config) are
+# logged but don't abort the sync because check_config will catch any
+# real damage.
+#
+# See: GitHub issue #2, M5.6 deploy saga in JLay2026/nanoclaw-zimaos.
+reconcile_tracked_files() {
+    local reconcile_count=0
+    local cp_failure_count=0
+
+    while IFS= read -r f; do
+        [ -z "${f}" ] && continue
+        # Only reconcile files in sync_paths — anything outside the
+        # allowlist would also be silently skipped on normal sync, so
+        # it's not our job to copy it.
+        if ! path_allowed "${f}"; then
+            continue
+        fi
+        # Already there → no-op.
+        if [ -f "${CONFIG_DIR}/${f}" ]; then
+            continue
+        fi
+        # Missing from /config → copy it.
+        local dst_dir
+        dst_dir="${CONFIG_DIR}/$(dirname "${f}")"
+        if ! mkdir -p "${dst_dir}" 2>/dev/null; then
+            bashio::log.warning "Reconcile: failed to mkdir '${dst_dir}' for tracked-but-missing file '${f}'"
+            cp_failure_count=$((cp_failure_count + 1))
+            continue
+        fi
+        if cp "${REPO_DIR}/${f}" "${CONFIG_DIR}/${f}" 2>/dev/null; then
+            bashio::log.info "Reconcile: copied tracked-but-missing file '${f}' to /config (issue #2 prevention)"
+            reconcile_count=$((reconcile_count + 1))
+        else
+            bashio::log.warning "Reconcile: cp failed for '${f}' — check_config may fail next"
+            cp_failure_count=$((cp_failure_count + 1))
+        fi
+    done < <(cd "${REPO_DIR}" && git ls-files 2>/dev/null)
+
+    if [ "${reconcile_count}" -gt 0 ] || [ "${cp_failure_count}" -gt 0 ]; then
+        bashio::log.info "Reconcile: ${reconcile_count} missing file(s) copied, ${cp_failure_count} failure(s)"
+    fi
+    return 0
+}
+
 # ── Git setup ─────────────────────────────────────────────────────
 
 # Configure git identity for export commits
@@ -320,22 +377,34 @@ audit_include_dir_directives
 
 # Copy sync_paths files from /config into the repo working tree.
 # Only touches files that match the sync_paths allowlist.
+#
+# Returns 0 if no files changed, 1 if any file was updated. The
+# return semantics let do_export() short-circuit when there's nothing
+# to commit.
 stage_config_to_repo() {
     local changed=0
 
     for pattern in "${SYNC_PATHS[@]}"; do
         if [[ "${pattern}" == */ ]]; then
-            # Directory prefix — copy matching files
+            # Directory prefix — copy matching files.
             if [ -d "${CONFIG_DIR}/${pattern}" ]; then
                 mkdir -p "${REPO_DIR}/${pattern}"
-                find "${CONFIG_DIR}/${pattern}" -type f -name '*.yaml' -o -name '*.yml' | while read -r src; do
+                # Process substitution (not a pipe) — the while loop runs
+                # in THIS shell so `changed=1` propagates. The old `find
+                # | while` form ran the while in a subshell and silently
+                # always returned 0 from the function. Also: explicit
+                # parens around the -name OR so `-type f` applies to both
+                # extensions (the old form matched any *.yml regardless
+                # of type due to operator precedence).
+                while IFS= read -r src; do
+                    [ -z "${src}" ] && continue
                     rel="${src#${CONFIG_DIR}/}"
                     mkdir -p "${REPO_DIR}/$(dirname "${rel}")"
                     if ! cmp -s "${src}" "${REPO_DIR}/${rel}" 2>/dev/null; then
                         cp "${src}" "${REPO_DIR}/${rel}"
                         changed=1
                     fi
-                done
+                done < <(find "${CONFIG_DIR}/${pattern}" -type f \( -name '*.yaml' -o -name '*.yml' \) 2>/dev/null)
             fi
         else
             # Exact file match
@@ -350,6 +419,22 @@ stage_config_to_repo() {
     done
 
     return ${changed}
+}
+
+# Switch back to the sync branch after an export operation, logging a
+# WARNING (not silent fallthrough) on failure. Used by do_export() in
+# multiple early-exit paths.
+checkout_back_to_sync_branch() {
+    if [ "${EXPORT_BRANCH}" = "${BRANCH}" ]; then
+        return 0  # already on the sync branch, no switch needed
+    fi
+    local co_err
+    if ! co_err=$(git checkout "${BRANCH}" --quiet 2>&1); then
+        bashio::log.warning "Export: failed to switch back to ${BRANCH} after export: $(sanitize_output "${co_err}")"
+        bashio::log.warning "  Next import cycle will operate on '${EXPORT_BRANCH}' until manually corrected."
+        return 1
+    fi
+    return 0
 }
 
 # Run one export cycle: compare /config to repo, commit + push if different.
@@ -375,28 +460,46 @@ do_export() {
     local current_branch
     current_branch=$(git rev-parse --abbrev-ref HEAD)
     if [ "${current_branch}" != "${EXPORT_BRANCH}" ]; then
-        # Fetch the export branch if it exists remotely
-        git fetch origin "${EXPORT_BRANCH}" --quiet 2>/dev/null || true
+        # Fetch the export branch if it exists remotely. Failure here is
+        # expected when the branch doesn't exist yet (first export); the
+        # checkout fallback handles creation. We log DEBUG instead of
+        # silent-fall-through so a genuine fetch failure isn't masked.
+        local fetch_err
+        if ! fetch_err=$(git fetch origin "${EXPORT_BRANCH}" 2>&1); then
+            bashio::log.debug "Export: fetch of ${EXPORT_BRANCH} failed (expected on first export): $(sanitize_output "${fetch_err}")"
+        fi
         if git show-ref --verify --quiet "refs/remotes/origin/${EXPORT_BRANCH}"; then
-            git checkout "${EXPORT_BRANCH}" --quiet 2>/dev/null || \
-                git checkout -b "${EXPORT_BRANCH}" "origin/${EXPORT_BRANCH}" --quiet
+            local co_err
+            if ! co_err=$(git checkout "${EXPORT_BRANCH}" --quiet 2>&1); then
+                if ! git checkout -b "${EXPORT_BRANCH}" "origin/${EXPORT_BRANCH}" --quiet 2>/dev/null; then
+                    bashio::log.error "Export: failed to switch to ${EXPORT_BRANCH}: $(sanitize_output "${co_err}")"
+                    return 1
+                fi
+            fi
         else
-            git checkout -b "${EXPORT_BRANCH}" --quiet 2>/dev/null || \
-                git checkout "${EXPORT_BRANCH}" --quiet
+            if ! git checkout -b "${EXPORT_BRANCH}" --quiet 2>/dev/null; then
+                local co_err
+                if ! co_err=$(git checkout "${EXPORT_BRANCH}" --quiet 2>&1); then
+                    bashio::log.error "Export: failed to switch to or create ${EXPORT_BRANCH}: $(sanitize_output "${co_err}")"
+                    return 1
+                fi
+            fi
         fi
     fi
 
-    # Stage /config files into the repo
+    # Stage /config files into the repo. stage_config_to_repo returns
+    # 1 if any file changed, 0 otherwise — but we don't act on the
+    # return here because `git diff --cached --quiet` below is the
+    # authoritative check (it sees the git index, which is what we'd
+    # be committing). The return code semantics are still preserved
+    # by the Sprint 2 race fix for future callers.
     stage_config_to_repo || true
 
     # Check for actual changes
     git add -A
     if git diff --cached --quiet; then
         bashio::log.debug "Export (${label}): no changes to export"
-        # Switch back to sync branch if different
-        if [ "${EXPORT_BRANCH}" != "${BRANCH}" ]; then
-            git checkout "${BRANCH}" --quiet 2>/dev/null || true
-        fi
+        checkout_back_to_sync_branch || true
         return 0
     fi
 
@@ -412,10 +515,7 @@ do_export() {
     # Push
     if [ -z "${PAT}" ]; then
         bashio::log.warning "Export: no github_pat configured — cannot push (read-only)"
-        # Switch back
-        if [ "${EXPORT_BRANCH}" != "${BRANCH}" ]; then
-            git checkout "${BRANCH}" --quiet 2>/dev/null || true
-        fi
+        checkout_back_to_sync_branch || true
         return 1
     fi
 
@@ -427,10 +527,7 @@ do_export() {
         bashio::log.error "Export (${label}): push failed — $(sanitize_output "${push_output}")"
     fi
 
-    # Switch back to sync branch if different
-    if [ "${EXPORT_BRANCH}" != "${BRANCH}" ]; then
-        git checkout "${BRANCH}" --quiet 2>/dev/null || true
-    fi
+    checkout_back_to_sync_branch || true
 }
 
 # ================================================================
@@ -521,6 +618,13 @@ do_import() {
         fi
     done <<< "${CHANGED}"
 
+    # ── Reconcile tracked-but-missing files (issue #2 fix, Sprint 2) ──
+    # Walk every tracked file matching sync_paths and copy any that are
+    # missing from /config. Catches the M5.6 bug class where a tracked-
+    # never-modified file fails to materialize on first sync, causing
+    # check_config to fail later because of an !include reference.
+    reconcile_tracked_files
+
     sleep 2  # let HA notice file changes
 
     # Validate config via Supervisor API
@@ -542,7 +646,14 @@ do_import() {
 
     if [ "${VALID}" = "valid" ]; then
         bashio::log.info "Import: config valid — reloading Home Assistant"
-        supervisor_api POST "/core/api/services/homeassistant/reload_all" > /dev/null 2>&1 || true
+        # Sprint 2: capture reload_all failure instead of silent || true.
+        # We don't abort on failure here — post-sync probes downstream
+        # will catch real breakage and trigger rollback. But the operator
+        # now sees the actual HTTP error if the reload itself failed.
+        if ! supervisor_api POST "/core/api/services/homeassistant/reload_all" > /dev/null; then
+            log_supervisor_error "reload_all API call failed — HA may not have picked up the changes"
+            bashio::log.warning "  Continuing to post-sync probes; they will catch any actual breakage."
+        fi
         bashio::log.info "Import: reload complete (${LOCAL:0:8} -> ${REMOTE:0:8})"
 
         # ── Post-sync verification probes ────────────────────────────
@@ -564,9 +675,13 @@ do_import() {
 
             # Best-effort re-reload with the rolled-back files. If HA is
             # too broken for this to succeed, the operator restores from
-            # the pre-sync HA backup below.
+            # the pre-sync HA backup below. Sprint 2: capture failure to
+            # log (was silently swallowed in v1.2.x).
             bashio::log.warning "Attempting re-reload of rolled-back files..."
-            supervisor_api POST "/core/api/services/homeassistant/reload_all" > /dev/null 2>&1 || true
+            if ! supervisor_api POST "/core/api/services/homeassistant/reload_all" > /dev/null; then
+                log_supervisor_error "Re-reload of rolled-back files also failed"
+                bashio::log.warning "  HA is in an inconsistent state; restore from the pre-sync backup."
+            fi
 
             bashio::log.error ""
             bashio::log.error "If HA is still broken, restore the pre-sync backup:"

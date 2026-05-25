@@ -1,5 +1,41 @@
 # Changelog
 
+## 1.3.0
+
+Sprint 2 of the hardening plan (see issue #9): eliminate silent and
+opaque failures across `do_import()` and `do_export()`. Closes #2.
+
+- **Fix (closes #2)**: New `reconcile_tracked_files()` pass runs after the
+  diff-based file copy in every sync that has changes. Walks every
+  tracked file matching `sync_paths` and copies any that are missing
+  from `/config`. Catches the bug class where a tracked-but-never-
+  modified file fails to materialize because it wasn't in any diff —
+  configuration.yaml's `!include` against it then fails check_config,
+  rolling back the sync forever. Eliminates the workaround chain from
+  the M5.6 deploy ([JLay2026/home-assistant-config#2/#3/#4](https://github.com/JLay2026/home-assistant-config)).
+- **Fix (Sprint 2 P0)**: Race condition in `stage_config_to_repo()`
+  where `find | while read; do changed=1; done` ran the while loop
+  in a subshell, so `changed=1` never propagated. Function always
+  returned 0 regardless of what changed. Replaced pipe with process
+  substitution `< <(find ...)`. Also fixed a `find` argument-precedence
+  bug that matched any `*.yml` regardless of file type.
+- **Fix (Sprint 2 P1 audit)**: Both `reload_all` API calls in
+  `do_import()` previously used `> /dev/null 2>&1 || true`, silently
+  swallowing failures. Now they check the return value and call
+  `log_supervisor_error()` (with HTTP code + Supervisor response body)
+  on failure. Doesn't abort — post-sync probes catch real breakage
+  downstream — but operators now see WHEN and WHY reload_all failed.
+- **Fix (Sprint 2 P1 audit)**: Three `git checkout "${BRANCH}" --quiet
+  2>/dev/null || true` calls in `do_export()` extracted into a single
+  `checkout_back_to_sync_branch()` helper. Captures `git checkout`
+  stderr via `2>&1`, logs WARNING on failure with PAT scrubbed via
+  `sanitize_output()`. Failure leaves the next import cycle on the
+  wrong branch — now visible in the log instead of silently desyncing.
+- **Improvement**: Branch-switch logic in `do_export()` startup now
+  properly chains: try direct checkout → fall back to `-b` create →
+  log ERROR on both-failed (was silent fall-through to commit-on-wrong-branch).
+- **No new config options**; no schema changes; reverse-compat with v1.2.x.
+
 ## 1.2.1
 
 - **Fix (P0)**: Grant `hassio_api: true` + `hassio_role: backup` so the
