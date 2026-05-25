@@ -171,7 +171,44 @@ To populate an empty repo with your current HA config:
 
 ## Logs
 
-Check the **Log** tab in the add-on panel.
+Check the **Log** tab in the add-on panel for the rolling add-on log.
+
+### Per-sync structured log (v1.4.1+)
+
+In addition to the rolling add-on log, every sync cycle that has changes
+writes a dedicated structured log file under `/data/logs/sync/` inside the
+add-on container. Filename is `<UTC-timestamp>-<remote-short-sha>.log`.
+Retention is hardcoded to the most-recent 20 files (oldest auto-deleted).
+
+Each file captures every major waypoint with `event=` keys:
+
+```
+2026-05-26T03:14:07Z [INFO] event=sync_start local=abc12345 remote=def67890
+2026-05-26T03:14:07Z [INFO] event=files_changed count=2 paths=automations.yaml,scripts.yaml
+2026-05-26T03:14:09Z [INFO] event=backup result=triggered name=gitops-pre-def67890
+2026-05-26T03:14:10Z [INFO] event=reconcile copied=0 failed=0
+2026-05-26T03:14:11Z [INFO] event=check_config result=valid
+2026-05-26T03:14:11Z [INFO] event=reload strategy=reload_all reason=no_lovelace_no_themes
+2026-05-26T03:14:17Z [INFO] event=verify probe=sun.sun result=pass
+2026-05-26T03:14:17Z [INFO] event=verify probe=core_api result=pass
+2026-05-26T03:14:17Z [INFO] event=sync_end result=success
+```
+
+Operator access:
+
+```
+docker exec -it addon_<slug>_config-sync ls -lt /data/logs/sync/
+docker exec -it addon_<slug>_config-sync cat /data/logs/sync/<filename>.log
+```
+
+Use this when investigating a past sync that the rolling log has scrolled
+past, or when reconstructing the exact sequence around a known-bad commit.
+The `/data/` mount is persistent across add-on restarts and upgrades, so
+the log history survives a container rebuild.
+
+If `mkdir` on the log directory fails (e.g. disk full), the cycle logs a
+WARNING to the rolling add-on log and continues — per-sync logging is
+best-effort and never blocks a sync.
 
 ### Import logs (happy path)
 
