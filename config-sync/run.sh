@@ -1615,13 +1615,21 @@ do_import() {
         fi
     done <<< "${CHANGED}"
 
-    # Copy changed files to /config
+    # Sync changed files to /config — copy adds/modifies, propagate deletes
     while IFS= read -r f; do
         [ -z "${f}" ] && continue
         if [ -f "${REPO_DIR}/${f}" ]; then
             mkdir -p "${CONFIG_DIR}/$(dirname "${f}")"
             cp -p "${REPO_DIR}/${f}" "${CONFIG_DIR}/${f}"
             bashio::log.debug "Import: copied ${f}"
+        elif [ -f "${CONFIG_DIR}/${f}" ]; then
+            # File was deleted (or renamed away) upstream — propagate
+            # the deletion to /config so the package validator / file
+            # registry stays in sync. Backup loop above snapshotted
+            # this file, so the rollback path restores it correctly
+            # if validation fails.
+            rm -f "${CONFIG_DIR}/${f}"
+            bashio::log.debug "Import: deleted ${f}"
         fi
     done <<< "${CHANGED}"
 
