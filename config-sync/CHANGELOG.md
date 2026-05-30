@@ -1,5 +1,42 @@
 # Changelog
 
+## 1.6.3
+
+Field-discovered regression fix: diff-sync was silently dropping file
+deletions. PRs that delete a file (or rename one, which git represents
+as add+delete) propagated the add to `/config` but left the deleted
+file on disk. The orphaned file kept failing config validation at
+every reload, producing repeating ERROR log entries even though the
+upstream repo was clean.
+
+- **Fix**: The copy loop in `do_import()` now handles three cases:
+  added/modified files are copied from `${REPO_DIR}` (existing
+  behavior), and deleted files are removed from `${CONFIG_DIR}` via
+  `rm -f` (new). The existing backup loop already snapshots the
+  about-to-be-deleted file from `${CONFIG_DIR}` (it copies whenever
+  the file exists locally, regardless of operation type), so the
+  existing rollback path restores it correctly if validation fails.
+
+- **Reproduction**: PR that adds `packages/foo.yaml` and deletes
+  `packages/_foo.yaml` in a single commit. Pre-fix: `_foo.yaml`
+  remained on disk and continued failing the package slug validator.
+  Post-fix: both operations propagate; `_foo.yaml` is removed on the
+  next sync.
+
+- **Field incident**: 2026-05-30, observed in
+  `JLay2026/home-assistant-config#43` (rename of `_shared_alert_macros.yaml`
+  to `shared_alert_macros.yaml`). The rename PR merged cleanly upstream
+  and the new file synced to `/config/packages/` at 18:23:05 UTC, but
+  the old underscored file remained — producing
+  `Setup of package '_shared_alert_macros' ... invalid slug` errors at
+  every subsequent reload (~20s cadence via the addon's sync loop).
+  Manually deleting the orphaned file from `/config/packages/` cleared
+  the error.
+
+- **No new options**; no schema changes; no permission changes; no
+  behavior change for adds or modifies. Backup and rollback paths
+  unchanged.
+
 ## 1.6.2
 
 Sprint 6 housekeeping release from the 2026-05-25 code-and-security
